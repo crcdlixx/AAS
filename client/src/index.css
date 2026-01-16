@@ -1,0 +1,36 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Playfair+Display:wght@600;700&family=Noto+Sans+SC:wght@400;500;600;700&family=Noto+Serif+SC:wght@600;700&display=swap');
+
+:root {
+  --text-primary: #0b1e18;
+  --text-muted: #506a61;
+  --accent-bright: #14c98b;
+  --card-surface: rgba(255, 255, 255, 0.88);
+  --stroke-soft: rgba(9, 66, 52, 0.12);
+  --stroke-strong: rgba(12, 115, 87, 0.28);
+  --font-body: 'Space Grotesk', 'Noto Sans SC', sans-serif;
+  --font-display: 'Playfair Display', 'Noto Serif SC', serif;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-body);
+  background-color: #f6faf8;
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+}
+
+#root {
+  min-height: 100vh;
+}

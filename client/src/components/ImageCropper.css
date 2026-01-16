@@ -1,0 +1,26 @@
+.image-cropper {
+  padding: 20px;
+}
+
+.image-cropper h3 {
+  margin-bottom: 8px;
+  color: var(--text-primary);
+}
+
+.image-cropper .hint {
+  color: var(--text-muted);
+  margin-bottom: 16px;
+  font-size: 14px;
+}
+
+.image-cropper img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 14px;
+  border: 1px solid var(--stroke-soft);
+}
+
+.ReactCrop {
+  max-width: 100%;
+}
