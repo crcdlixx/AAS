@@ -3,12 +3,15 @@ import { HumanMessage } from '@langchain/core/messages'
 import fs from 'fs'
 import path from 'path'
 import dotenv from 'dotenv'
+import { estimateTokensFromText, extractTotalTokens } from './tokenUsage.js'
+import type { ApiOverride } from './apiOverride.js'
 
 dotenv.config()
 
 export interface SolveResult {
   question: string
   answer: string
+  tokensUsed?: number
 }
 
 export type StreamUpdate =
@@ -47,16 +50,16 @@ const getOptionalMaxTokens = (): number | undefined => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
 }
 
-const createModel = (streaming = false) => {
+const createModel = (streaming = false, apiOverride?: ApiOverride) => {
   const maxTokens = getOptionalMaxTokens()
   return new ChatOpenAI({
-    modelName: process.env.OPENAI_MODEL || 'gpt-4o',
+    modelName: apiOverride?.model || process.env.OPENAI_MODEL || 'gpt-4o',
     temperature: 0.7,
     ...(maxTokens ? { maxTokens } : {}),
     streaming,
-    openAIApiKey: process.env.OPENAI_API_KEY,
+    openAIApiKey: apiOverride?.apiKey || process.env.OPENAI_API_KEY,
     configuration: {
-      baseURL: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
+      baseURL: apiOverride?.baseURL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
     }
   })
 }
@@ -110,25 +113,28 @@ const getEndOutputText = (output: any): { text: string; finishReason?: string } 
 
 export async function solveQuestionStream(
   imagePath: string,
-  onUpdate?: (update: StreamUpdate) => void
+  onUpdate?: (update: StreamUpdate) => void,
+  apiOverride?: ApiOverride
 ): Promise<SolveResult> {
-  return solveQuestionStreamFromImages([imagePath], undefined, onUpdate)
+  return solveQuestionStreamFromImages([imagePath], undefined, onUpdate, apiOverride)
 }
 
 export async function solveQuestionStreamFromImages(
   imagePaths: string[],
   extraPrompt?: string,
-  onUpdate?: (update: StreamUpdate) => void
+  onUpdate?: (update: StreamUpdate) => void,
+  apiOverride?: ApiOverride
 ): Promise<SolveResult> {
   try {
     const images = encodeImages(imagePaths)
-    const model = createModel(true)
+    const model = createModel(true, apiOverride)
     const stream = await model.streamEvents(buildMessages(images, extraPrompt), { version: 'v1' })
 
     onUpdate?.({ type: 'start' })
     let content = ''
     let finishReason: string | undefined
     let endEventText = ''
+    let tokensUsed: number | undefined
     let deltaCount = 0
 
     for await (const event of stream) {
@@ -147,6 +153,7 @@ export async function solveQuestionStreamFromImages(
           endEventText = text
         }
         if (reason) finishReason = reason
+        tokensUsed = tokensUsed ?? extractTotalTokens(event.data?.output)
       }
     }
 
@@ -167,7 +174,7 @@ export async function solveQuestionStreamFromImages(
         deltaCount,
         contentLength: content.length
       })
-      const fallback = await solveQuestionFromImages(imagePaths, extraPrompt)
+      const fallback = await solveQuestionFromImages(imagePaths, extraPrompt, apiOverride)
       const fallbackText = `题目：${fallback.question}\n\n解答：${fallback.answer}`
       onUpdate?.({ type: 'complete', value: fallbackText, result: fallback })
       return fallback
@@ -178,11 +185,16 @@ export async function solveQuestionStreamFromImages(
       deltaCount,
       contentLength: content.length
     })
-    const result = parsed
+    const result: SolveResult = {
+      ...parsed,
+      tokensUsed:
+        tokensUsed ??
+        estimateTokensFromText(PROMPT + (extraPrompt ? `\n${extraPrompt}` : '')) + estimateTokensFromText(content)
+    }
     onUpdate?.({ type: 'complete', value: content, result })
     return result
   } catch (error) {
-    console.error('OpenAI API调用失败:', error)
+    console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
     onUpdate?.({
       type: 'error',
       message: error instanceof Error ? error.message : 'AI解答失败，请检查API配置'
@@ -191,20 +203,29 @@ export async function solveQuestionStreamFromImages(
   }
 }
 
-export async function solveQuestion(imagePath: string): Promise<SolveResult> {
-  return solveQuestionFromImages([imagePath])
+export async function solveQuestion(imagePath: string, apiOverride?: ApiOverride): Promise<SolveResult> {
+  return solveQuestionFromImages([imagePath], undefined, apiOverride)
 }
 
-export async function solveQuestionFromImages(imagePaths: string[], extraPrompt?: string): Promise<SolveResult> {
+export async function solveQuestionFromImages(
+  imagePaths: string[],
+  extraPrompt?: string,
+  apiOverride?: ApiOverride
+): Promise<SolveResult> {
   try {
     const images = encodeImages(imagePaths)
-    const model = createModel()
+    const model = createModel(false, apiOverride)
     const response = await model.invoke(buildMessages(images, extraPrompt))
     const content = toText(response.content) || '无法识别题目'
 
-    return buildSolveResult(content)
+    const parsed = buildSolveResult(content)
+    const tokensUsed =
+      extractTotalTokens(response) ??
+      estimateTokensFromText(PROMPT + (extraPrompt ? `\n${extraPrompt}` : '')) + estimateTokensFromText(content)
+
+    return { ...parsed, tokensUsed }
   } catch (error) {
-    console.error('OpenAI API调用失败:', error)
+    console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
     throw new Error('AI解答失败，请检查API配置')
   }
 }

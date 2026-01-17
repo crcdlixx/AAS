@@ -3,6 +3,8 @@ import { HumanMessage } from '@langchain/core/messages'
 import fs from 'fs'
 import path from 'path'
 import dotenv from 'dotenv'
+import { estimateTokensFromText, extractTotalTokens } from './tokenUsage.js'
+import type { ApiOverride } from './apiOverride.js'
 
 dotenv.config()
 
@@ -16,6 +18,7 @@ interface DebateState {
   max_iterations: number
   consensus_reached: boolean
   final_answer: string
+  tokens_used: number
 }
 
 type DebateStreamUpdate = {
@@ -27,34 +30,32 @@ type DebateStreamUpdate = {
 
 type DebateUpdateHandler = (update: DebateStreamUpdate) => void
 
-function initializeModels() {
+type DebateModels = { model1: ChatOpenAI; model2: ChatOpenAI }
+
+const createModels = (apiOverride?: ApiOverride): DebateModels => {
+  const defaultKey = process.env.OPENAI_API_KEY
+  const overrideKey = apiOverride?.apiKey
+  const overrideBase = apiOverride?.baseURL
+  const overrideModel = apiOverride?.model
+
   const model1 = new ChatOpenAI({
-    modelName: process.env.MODEL1_NAME || 'gpt-4o-mini',
+    modelName: overrideModel || process.env.MODEL1_NAME || 'gpt-4o-mini',
     temperature: 0.7,
-    openAIApiKey: process.env.MODEL1_API_KEY || process.env.OPENAI_API_KEY,
-    configuration: {
-      baseURL: process.env.MODEL1_BASE_URL || 'https://api.openai.com/v1'
-    }
+    openAIApiKey: overrideKey || process.env.MODEL1_API_KEY || defaultKey,
+    configuration: { baseURL: overrideBase || process.env.MODEL1_BASE_URL || 'https://api.openai.com/v1' }
   })
 
   const model2 = new ChatOpenAI({
-    modelName: process.env.MODEL2_NAME || 'gpt-4o',
+    modelName: overrideModel || process.env.MODEL2_NAME || 'gpt-4o',
     temperature: 0.7,
-    openAIApiKey: process.env.MODEL2_API_KEY || process.env.OPENAI_API_KEY,
-    configuration: {
-      baseURL: process.env.MODEL2_BASE_URL || 'https://api.openai.com/v1'
-    }
+    openAIApiKey: overrideKey || process.env.MODEL2_API_KEY || defaultKey,
+    configuration: { baseURL: overrideBase || process.env.MODEL2_BASE_URL || 'https://api.openai.com/v1' }
   })
-
-  console.log(`模型1: ${process.env.MODEL1_NAME || 'gpt-4o-mini'} @ ${process.env.MODEL1_BASE_URL || 'default'}`)
-  console.log(`模型2: ${process.env.MODEL2_NAME || 'gpt-4o'} @ ${process.env.MODEL2_BASE_URL || 'default'}`)
 
   return { model1, model2 }
 }
 
-const { model1, model2 } = initializeModels()
-
-async function model1Propose(state: DebateState, onUpdate?: DebateUpdateHandler): Promise<DebateState> {
+async function model1Propose(state: DebateState, models: DebateModels, onUpdate?: DebateUpdateHandler): Promise<DebateState> {
   const { iteration, images, extraPrompt, model1_answer, model2_review } = state
 
   let content: any[]
@@ -98,8 +99,9 @@ ${model2_review}
     ]
   }
 
-  const response = await model1.invoke([new HumanMessage({ content })])
+  const response = await models.model1.invoke([new HumanMessage({ content })])
   const answer = response.content as string
+  state.tokens_used += extractTotalTokens(response) ?? estimateTokensFromText(answer)
 
   console.log(`\n${'='.repeat(60)}`)
   console.log(`迭代 ${iteration + 1} - 模型1的答案：`)
@@ -113,7 +115,7 @@ ${model2_review}
   return state
 }
 
-async function model2Review(state: DebateState, onUpdate?: DebateUpdateHandler): Promise<DebateState> {
+async function model2Review(state: DebateState, models: DebateModels, onUpdate?: DebateUpdateHandler): Promise<DebateState> {
   const { question, model1_answer, iteration } = state
 
   const prompt = `原始任务：识别并解答图片中的题目
@@ -130,8 +132,9 @@ ${model1_answer}
 如果答案已经很好，请回复"APPROVED: [简短说明为什么这个答案很好]"
 如果需要改进，请提供具体的改进建议。`
 
-  const response = await model2.invoke([new HumanMessage(prompt)])
+  const response = await models.model2.invoke([new HumanMessage(prompt)])
   const review = response.content as string
+  state.tokens_used += extractTotalTokens(response) ?? estimateTokensFromText(review)
 
   console.log(`\n${'-'.repeat(60)}`)
   console.log(`模型2的审查意见：`)
@@ -153,14 +156,15 @@ ${model1_answer}
   return state
 }
 
-export async function solveQuestionWithDebate(imagePath: string, maxIterations: number = 3) {
-  return solveQuestionWithDebateFromImages([imagePath], maxIterations)
+export async function solveQuestionWithDebate(imagePath: string, maxIterations: number = 3, apiOverride?: ApiOverride) {
+  return solveQuestionWithDebateFromImages([imagePath], maxIterations, undefined, apiOverride)
 }
 
 export async function solveQuestionWithDebateFromImages(
   imagePaths: string[],
   maxIterations: number = 3,
-  extraPrompt?: string
+  extraPrompt?: string,
+  apiOverride?: ApiOverride
 ) {
   try {
     console.log(`\n${'='.repeat(60)}`)
@@ -173,6 +177,7 @@ export async function solveQuestionWithDebateFromImages(
       mimeType: getMimeType(p)
     }))
 
+    const models = createModels(apiOverride)
     let state: DebateState = {
       question: '识别并解答图片中的题目',
       images,
@@ -182,16 +187,17 @@ export async function solveQuestionWithDebateFromImages(
       iteration: 0,
       max_iterations: maxIterations,
       consensus_reached: false,
-      final_answer: ''
+      final_answer: '',
+      tokens_used: 0
     }
 
     // 博弈循环
     while (state.iteration < maxIterations && !state.consensus_reached) {
       // 模型1提出或改进答案
-      state = await model1Propose(state)
+      state = await model1Propose(state, models)
       
       // 模型2审查
-      state = await model2Review(state)
+      state = await model2Review(state, models)
     }
 
     console.log(`\n${'='.repeat(60)}`)
@@ -211,10 +217,11 @@ export async function solveQuestionWithDebateFromImages(
       question: questionMatch ? questionMatch[1].trim() : '未识别到题目',
       answer: answerMatch ? answerMatch[1].trim() : answer,
       iterations: state.iteration,
-      consensus: state.consensus_reached
+      consensus: state.consensus_reached,
+      tokensUsed: state.tokens_used
     }
   } catch (error) {
-    console.error('多模型博弈失败:', error)
+    console.error('多模型博弈失败:', error instanceof Error ? error.message : error)
     throw new Error('多模型博弈失败，请检查配置')
   }
 }
@@ -222,16 +229,18 @@ export async function solveQuestionWithDebateFromImages(
 export async function solveQuestionWithDebateStream(
   imagePath: string,
   maxIterations: number = 3,
-  onUpdate?: DebateUpdateHandler
+  onUpdate?: DebateUpdateHandler,
+  apiOverride?: ApiOverride
 ) {
-  return solveQuestionWithDebateStreamFromImages([imagePath], maxIterations, undefined, onUpdate)
+  return solveQuestionWithDebateStreamFromImages([imagePath], maxIterations, undefined, onUpdate, apiOverride)
 }
 
 export async function solveQuestionWithDebateStreamFromImages(
   imagePaths: string[],
   maxIterations: number = 3,
   extraPrompt?: string,
-  onUpdate?: DebateUpdateHandler
+  onUpdate?: DebateUpdateHandler,
+  apiOverride?: ApiOverride
 ) {
   try {
     console.log(`\n${'='.repeat(60)}`)
@@ -244,6 +253,7 @@ export async function solveQuestionWithDebateStreamFromImages(
       mimeType: getMimeType(p)
     }))
 
+    const models = createModels(apiOverride)
     let state: DebateState = {
       question: '识别并解答图片中的题目',
       images,
@@ -253,19 +263,20 @@ export async function solveQuestionWithDebateStreamFromImages(
       iteration: 0,
       max_iterations: maxIterations,
       consensus_reached: false,
-      final_answer: ''
+      final_answer: '',
+      tokens_used: 0
     }
 
     while (state.iteration < maxIterations && !state.consensus_reached) {
       if (onUpdate) {
         onUpdate({ type: 'status', message: '模型1 生成答案中...', iteration: state.iteration + 1 })
       }
-      state = await model1Propose(state, onUpdate)
+      state = await model1Propose(state, models, onUpdate)
 
       if (onUpdate) {
         onUpdate({ type: 'status', message: '模型2 审查中...', iteration: state.iteration + 1 })
       }
-      state = await model2Review(state, onUpdate)
+      state = await model2Review(state, models, onUpdate)
     }
 
     console.log(`\n${'='.repeat(60)}`)
@@ -282,10 +293,11 @@ export async function solveQuestionWithDebateStreamFromImages(
       question: questionMatch ? questionMatch[1].trim() : '未识别到题目',
       answer: answerMatch ? answerMatch[1].trim() : answer,
       iterations: state.iteration,
-      consensus: state.consensus_reached
+      consensus: state.consensus_reached,
+      tokensUsed: state.tokens_used
     }
   } catch (error) {
-    console.error('多模型博弈失败:', error)
+    console.error('多模型博弈失败:', error instanceof Error ? error.message : error)
     throw new Error('多模型博弈失败，请检查配置')
   }
 }

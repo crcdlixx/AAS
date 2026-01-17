@@ -1,10 +1,28 @@
-import { useMemo, useState } from 'react'
-import { Upload, Button, Card, message, Switch, Space, Tooltip, Tabs, Drawer, Collapse, Tag, FloatButton } from 'antd'
-import { UploadOutlined, SendOutlined, TeamOutlined, UserOutlined, DeleteOutlined, DownloadOutlined } from '@ant-design/icons'
+import { useEffect, useMemo, useState } from 'react'
+import {
+  Upload,
+  Button,
+  Card,
+  message,
+  Switch,
+  Space,
+  Tooltip,
+  Tabs,
+  Drawer,
+  Collapse,
+  Tag,
+  FloatButton,
+  Modal,
+  Select,
+  Progress,
+  Input
+} from 'antd'
+import { UploadOutlined, SendOutlined, TeamOutlined, UserOutlined, DeleteOutlined, DownloadOutlined, LinkOutlined } from '@ant-design/icons'
 import type { UploadFile } from 'antd'
 import MultiCropper, { CropBox, CropGroups, ModelMode } from './components/MultiCropper'
 import MarkdownView from './components/MarkdownView'
-import { solveQuestionMultiStream, StreamEvent, SolveQuestionResponse } from './services/api'
+import { getUsage, solveQuestionMultiStream, StreamEvent, SolveQuestionResponse, type ApiConfig, type UsageInfo } from './services/api'
+import { cropToJpegBlobFromFile } from './utils/cropBlob'
 import logo from './assets/logo.png'
 import './App.css'
 
@@ -31,6 +49,12 @@ type SolveTask = {
   error?: string
 }
 
+type CrossImageMergeOverride = {
+  fromImageId: string
+  fromCropId: string
+  toCropId: string
+}
+
 const createId = () =>
   typeof crypto !== 'undefined' && 'randomUUID' in crypto
     ? crypto.randomUUID()
@@ -45,10 +69,34 @@ function App() {
   const [taskDrawerOpen, setTaskDrawerOpen] = useState(false)
   const [exportingMd, setExportingMd] = useState(false)
   const [globalMode, setGlobalMode] = useState<ModelMode>('single')
+  const [usageInfo, setUsageInfo] = useState<UsageInfo | null>(null)
+  const [apiConfigOpen, setApiConfigOpen] = useState(false)
+  const [apiConfigEnabled, setApiConfigEnabled] = useState(false)
+  const [apiKey, setApiKey] = useState('')
+  const [apiBaseUrl, setApiBaseUrl] = useState('')
+  const [apiModel, setApiModel] = useState('')
+  const [crossImageMergeEnabled, setCrossImageMergeEnabled] = useState(true)
+  const [crossImageMergeOverrides, setCrossImageMergeOverrides] = useState<Record<string, CrossImageMergeOverride>>({})
+  const [crossImageMergeModalOpen, setCrossImageMergeModalOpen] = useState(false)
+  const [mergeFromCropId, setMergeFromCropId] = useState<string>('')
+  const [mergeToCropId, setMergeToCropId] = useState<string>('')
 
   const activeImage = useMemo(() => images.find((img) => img.id === activeImageId), [images, activeImageId])
+  const activeImageIndex = useMemo(() => images.findIndex((img) => img.id === activeImageId), [images, activeImageId])
+  const prevImage = useMemo(
+    () => (activeImageIndex > 0 ? images[activeImageIndex - 1] : undefined),
+    [images, activeImageIndex]
+  )
   const runningCount = useMemo(() => tasks.filter((t) => t.status === 'running' || t.status === 'pending').length, [tasks])
   const hasAnyTasks = tasks.length > 0
+  const activeApiConfig = useMemo<ApiConfig | undefined>(() => {
+    if (!apiConfigEnabled) return undefined
+    const key = apiKey.trim()
+    if (!key) return undefined
+    const baseUrl = apiBaseUrl.trim()
+    const model = apiModel.trim()
+    return { apiKey: key, baseUrl: baseUrl || undefined, model: model || undefined }
+  }, [apiConfigEnabled, apiKey, apiBaseUrl, apiModel])
 
   const handleUpload = (file: File) => {
     const id = createId()
@@ -90,6 +138,15 @@ function App() {
       return next
     })
     setFileList((prev) => prev.filter((f) => f.uid !== id))
+    setCrossImageMergeOverrides((prev) => {
+      const next: Record<string, CrossImageMergeOverride> = {}
+      for (const [toImageId, rule] of Object.entries(prev)) {
+        if (toImageId === id) continue
+        if (rule.fromImageId === id) continue
+        next[toImageId] = rule
+      }
+      return next
+    })
   }
 
   const resetAll = () => {
@@ -100,21 +157,66 @@ function App() {
     setActiveImageId('')
     setFileList([])
     setTasks([])
+    setCrossImageMergeOverrides({})
+    setCrossImageMergeModalOpen(false)
+    setMergeFromCropId('')
+    setMergeToCropId('')
   }
 
   const updateImage = (id: string, updater: (img: ImageItem) => ImageItem) => {
     setImages((prev) => prev.map((img) => (img.id === id ? updater(img) : img)))
   }
 
-  const buildPrompt = (groupTitle: string, groupCrops: CropBox[]) => {
+  const buildPrompt = (groupTitle: string, groupCrops: Array<{ label: string; title: string }>) => {
     const lines: string[] = []
     if (groupCrops.length > 1) {
-      lines.push(`以下是同一道题的多个裁剪区域，请合并理解后解答。合并题目：${groupTitle}`)
+      lines.push(`以下是同一道题的多个裁剪区域（可能跨多张图片），请合并理解后解答。合并题目：${groupTitle}`)
     } else {
       lines.push(`题目标题：${groupTitle}`)
     }
-    lines.push(...groupCrops.map((c, idx) => `区域${idx + 1}：${c.title || `题目 ${idx + 1}`}`))
+    lines.push(...groupCrops.map((c, idx) => `区域${idx + 1}：${c.label} - ${c.title || `题目 ${idx + 1}`}`))
     return lines.join('\n')
+  }
+
+  const openCrossImageMergeModal = () => {
+    if (!activeImage) return
+    if (!prevImage) {
+      setMergeFromCropId('')
+      setMergeToCropId(activeImage.crops[0]?.id || '')
+      setCrossImageMergeModalOpen(true)
+      return
+    }
+
+    const override = crossImageMergeOverrides[activeImage.id]
+    const defaultFrom = prevImage.crops[prevImage.crops.length - 1]?.id || ''
+    const defaultTo = activeImage.crops[0]?.id || ''
+    setMergeFromCropId(override?.fromCropId || defaultFrom)
+    setMergeToCropId(override?.toCropId || defaultTo)
+    setCrossImageMergeModalOpen(true)
+  }
+
+  const applyCrossImageMergeOverride = () => {
+    if (!activeImage || !prevImage) return
+    if (!mergeFromCropId || !mergeToCropId) {
+      message.warning('请选择要合并的题目')
+      return
+    }
+    setCrossImageMergeOverrides((prev) => ({
+      ...prev,
+      [activeImage.id]: { fromImageId: prevImage.id, fromCropId: mergeFromCropId, toCropId: mergeToCropId }
+    }))
+    message.success('已应用跨图合并规则')
+    setCrossImageMergeModalOpen(false)
+  }
+
+  const clearCrossImageMergeOverride = () => {
+    if (!activeImage) return
+    setCrossImageMergeOverrides((prev) => {
+      const next = { ...prev }
+      delete next[activeImage.id]
+      return next
+    })
+    message.success('已清除自定义跨图合并规则')
   }
 
   const runTask = async (task: SolveTask, blobs: Blob[], prompt: string) => {
@@ -123,7 +225,15 @@ function App() {
     const sanitize = (text: string) => text.replace(/<\/?think>/g, '')
 
     try {
-      const response = await solveQuestionMultiStream(blobs, task.mode === 'debate', prompt, (event: StreamEvent) => {
+      if (apiConfigEnabled && !apiKey.trim()) {
+        message.error('已开启自定义 API，但未填写 API Key')
+        return
+      }
+      const response = await solveQuestionMultiStream(
+        blobs,
+        task.mode === 'debate',
+        prompt,
+        (event: StreamEvent) => {
         setTasks((prev) =>
           prev.map((t) => {
             if (t.id !== task.id) return t
@@ -150,7 +260,10 @@ function App() {
             return t
           })
         )
-      })
+        },
+        (u) => setUsageInfo(u),
+        activeApiConfig
+      )
 
       setTasks((prev) =>
         prev.map((t) =>
@@ -163,24 +276,85 @@ function App() {
             : t
         )
       )
+      try {
+        setUsageInfo(await getUsage())
+      } catch {
+        // ignore
+      }
       message.success(task.mode === 'debate' ? '多模型博弈完成！' : 'AI解答完成！')
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : '解答失败，请重试'
       setTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, status: 'error', error: errorMessage } : t)))
       message.error(errorMessage)
       console.error(error)
+      try {
+        setUsageInfo(await getUsage())
+      } catch {
+        // ignore
+      }
     }
   }
 
+  useEffect(() => {
+    if (!taskDrawerOpen) return
+    ;(async () => {
+      try {
+        setUsageInfo(await getUsage())
+      } catch {
+        // ignore
+      }
+    })()
+  }, [taskDrawerOpen])
+
   const solveActiveImage = async () => {
     if (!activeImage) return
+    if (apiConfigEnabled && !apiKey.trim()) {
+      message.error('已开启自定义 API，但未填写 API Key')
+      return
+    }
 
-    const groups = new Map<string, CropBox[]>()
+    type CropRef = { image: ImageItem; crop: CropBox; label: string; order: number }
+
+    const groupKey = (crop: CropBox) => crop.groupId || crop.id
+
+    const groups = new Map<string, CropRef[]>()
+    const addToGroup = (key: string, ref: CropRef) => {
+      const current = groups.get(key) || []
+      const exists = current.some((x) => x.image.id === ref.image.id && x.crop.id === ref.crop.id)
+      if (!exists) groups.set(key, [...current, ref])
+    }
+
+    const activeCropOrder = new Map<string, number>()
+    activeImage.crops.forEach((c, idx) => activeCropOrder.set(c.id, idx))
+
     for (const crop of activeImage.crops) {
-      const key = crop.groupId || crop.id
-      const arr = groups.get(key) || []
-      arr.push(crop)
-      groups.set(key, arr)
+      addToGroup(groupKey(crop), {
+        image: activeImage,
+        crop,
+        label: activeImage.name,
+        order: (activeImageIndex >= 0 ? activeImageIndex : 0) * 10_000 + (activeCropOrder.get(crop.id) ?? 0)
+      })
+    }
+
+    if (crossImageMergeEnabled && prevImage && prevImage.crops.length && activeImage.crops.length) {
+      const override = crossImageMergeOverrides[activeImage.id]
+      const fallbackFrom = prevImage.crops[prevImage.crops.length - 1]
+      const fallbackTo = activeImage.crops[0]
+
+      const fromCrop =
+        (override?.fromImageId === prevImage.id ? prevImage.crops.find((c) => c.id === override.fromCropId) : undefined) ||
+        fallbackFrom
+      const toCrop = activeImage.crops.find((c) => c.id === override?.toCropId) || fallbackTo
+
+      if (fromCrop && toCrop) {
+        const key = groupKey(toCrop)
+        addToGroup(key, {
+          image: prevImage,
+          crop: fromCrop,
+          label: prevImage.name,
+          order: (activeImageIndex - 1) * 10_000 + Math.max(prevImage.crops.findIndex((c) => c.id === fromCrop.id), 0)
+        })
+      }
     }
 
     if (!groups.size) {
@@ -188,18 +362,36 @@ function App() {
       return
     }
 
-    for (const [groupId, groupCrops] of groups) {
-      const title = activeImage.groups[groupId] || groupCrops[0]?.title || '题目'
+    const ensureBlob = async (image: ImageItem, crop: CropBox): Promise<Blob | null> => {
+      if (crop.blob) return crop.blob
+      try {
+        const blob = await cropToJpegBlobFromFile(image.file, crop.crop)
+        if (blob) {
+          updateImage(image.id, (prev) => ({
+            ...prev,
+            crops: prev.crops.map((c) => (c.id === crop.id ? { ...c, blob } : c))
+          }))
+        }
+        return blob
+      } catch {
+        return null
+      }
+    }
+
+    for (const [groupId, groupRefs] of groups) {
+      const groupCrops = [...groupRefs].sort((a, b) => a.order - b.order)
+      const title = activeImage.groups[groupId] || groupCrops.find((x) => x.image.id === activeImage.id)?.crop.title || '题目'
       const blobs: Blob[] = []
-      for (const c of groupCrops) {
-        if (!c.blob) {
-          message.error(`「${c.title || title}」尚未保存裁剪区域（请先调整一次裁剪框）`)
+      for (const ref of groupCrops) {
+        const blob = await ensureBlob(ref.image, ref.crop)
+        if (!blob) {
+          message.error(`「${ref.crop.title || title}」裁剪区域生成失败（请尝试重新调整裁剪框）`)
           return
         }
-        blobs.push(c.blob)
+        blobs.push(blob)
       }
 
-      const mode = groupCrops[0]?.mode || activeImage.defaultMode
+      const mode = groupCrops.find((x) => x.image.id === activeImage.id)?.crop.mode || activeImage.defaultMode
       const task: SolveTask = {
         id: createId(),
         createdAt: Date.now(),
@@ -209,7 +401,10 @@ function App() {
         status: 'running',
         streamText: ''
       }
-      const prompt = buildPrompt(title, groupCrops)
+      const prompt = buildPrompt(
+        title,
+        groupCrops.map((x) => ({ label: x.label, title: x.crop.title }))
+      )
       setTasks((prev) => [task, ...prev])
       runTask(task, blobs, prompt)
     }
@@ -293,13 +488,14 @@ function App() {
             <p className="ant-upload-text">点击或拖拽多张图片到此区域上传</p>
             <p className="ant-upload-hint">支持 JPG、PNG、WebP 等图片格式</p>
           </Upload.Dragger>
-          {images.length > 0 && (
-            <div className="action-buttons">
+          <div className="action-buttons" style={{ justifyContent: 'space-between' }}>
+            <Button onClick={() => setApiConfigOpen(true)}>自定义 API（临时）{apiConfigEnabled ? '：已开启' : ''}</Button>
+            {images.length > 0 && (
               <Button danger icon={<DeleteOutlined />} onClick={resetAll}>
                 清空所有图片与结果
               </Button>
-            </div>
-          )}
+            )}
+          </div>
         </Card>
 
         {images.length > 0 && (
@@ -362,6 +558,9 @@ function App() {
                         </Space>
 
                         <Space wrap>
+                          <Button icon={<LinkOutlined />} onClick={openCrossImageMergeModal} disabled={!activeImage}>
+                            跨图合并
+                          </Button>
                           <Button danger icon={<DeleteOutlined />} onClick={() => removeImage(img.id)}>
                             删除该图片
                           </Button>
@@ -418,6 +617,29 @@ function App() {
             </Space>
           }
         >
+          {usageInfo?.enabled && usageInfo.limitTokens > 0 ? (
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                <span>Token 用量</span>
+                <span style={{ color: 'rgba(0,0,0,0.65)' }}>
+                  {usageInfo.usedTokens}/{usageInfo.limitTokens}
+                </span>
+              </div>
+              <Progress
+                percent={Math.min(100, Math.round((usageInfo.usedTokens / usageInfo.limitTokens) * 100))}
+                status={usageInfo.remainingTokens <= 0 ? 'exception' : 'active'}
+              />
+              <div style={{ display: 'flex', justifyContent: 'space-between', color: 'rgba(0,0,0,0.45)' }}>
+                <span>剩余 {usageInfo.remainingTokens}</span>
+                <span>
+                  重置 {new Date(usageInfo.resetAtMs).toLocaleString()}（{usageInfo.windowHours}h）
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div style={{ marginBottom: 16, color: 'rgba(0,0,0,0.45)' }}>Token 用量限制未开启</div>
+          )}
+
           <Collapse
             accordion={false}
             items={tasks.map((task) => {
@@ -431,6 +653,7 @@ function App() {
                     <span className="task-title">{task.title}</span>
                     <Space size="small">
                       <Tag color="blue">{modeLabel}</Tag>
+                      {typeof task.result?.tokensUsed === 'number' && <Tag color="purple">{task.result.tokensUsed} tokens</Tag>}
                       <Tag color={statusColor}>{task.status}</Tag>
                     </Space>
                   </div>
@@ -484,6 +707,124 @@ function App() {
             badge={{ count: runningCount }}
           />
         )}
+
+        <Modal
+          title="跨图片合并"
+          open={crossImageMergeModalOpen}
+          onCancel={() => setCrossImageMergeModalOpen(false)}
+          footer={
+            <Space>
+              {activeImage && crossImageMergeOverrides[activeImage.id] && (
+                <Button danger onClick={clearCrossImageMergeOverride}>
+                  清除自定义
+                </Button>
+              )}
+              <Button onClick={() => setCrossImageMergeModalOpen(false)}>关闭</Button>
+              <Button type="primary" onClick={applyCrossImageMergeOverride} disabled={!prevImage}>
+                应用自定义
+              </Button>
+            </Space>
+          }
+        >
+          <Space direction="vertical" style={{ width: '100%' }} size="middle">
+            <div>
+              <div style={{ marginBottom: 8 }}>启用跨图合并</div>
+              <Switch
+                checked={crossImageMergeEnabled}
+                onChange={setCrossImageMergeEnabled}
+                checkedChildren="开启"
+                unCheckedChildren="关闭"
+              />
+            </div>
+
+            {!prevImage ? (
+              <div style={{ color: 'rgba(0,0,0,0.45)' }}>当前为第一张图片，没有上一张可合并。</div>
+            ) : (
+              <Space direction="vertical" style={{ width: '100%' }}>
+                <div style={{ color: 'rgba(0,0,0,0.45)' }}>
+                  默认规则：上一张图片的最后一个题目合并到本图的第一个题目（开启时生效）。可在下方自定义覆盖。
+                </div>
+                <div>
+                  <div style={{ marginBottom: 8 }}>上一张图片题目</div>
+                  <Select
+                    style={{ width: '100%' }}
+                    value={mergeFromCropId}
+                    onChange={setMergeFromCropId}
+                    options={prevImage.crops.map((c, idx) => ({ value: c.id, label: `${idx + 1}. ${c.title || '题目'}` }))}
+                  />
+                </div>
+                <div>
+                  <div style={{ marginBottom: 8 }}>本图题目</div>
+                  <Select
+                    style={{ width: '100%' }}
+                    value={mergeToCropId}
+                    onChange={setMergeToCropId}
+                    options={activeImage?.crops.map((c, idx) => ({ value: c.id, label: `${idx + 1}. ${c.title || '题目'}` })) ?? []}
+                  />
+                </div>
+              </Space>
+            )}
+          </Space>
+        </Modal>
+
+        <Modal
+          title="自定义 API（临时，不保存）"
+          open={apiConfigOpen}
+          onCancel={() => setApiConfigOpen(false)}
+          footer={
+            <Space>
+              <Button
+                danger
+                onClick={() => {
+                  setApiConfigEnabled(false)
+                  setApiKey('')
+                  setApiBaseUrl('')
+                  setApiModel('')
+                }}
+              >
+                清空
+              </Button>
+              <Button onClick={() => setApiConfigOpen(false)}>关闭</Button>
+            </Space>
+          }
+        >
+          <Space direction="vertical" style={{ width: '100%' }} size="middle">
+            <div style={{ color: 'rgba(0,0,0,0.45)' }}>
+              仅本次页面会话生效，不会写入本地存储；刷新页面会丢失。API Key 会随请求发送到本服务端用于调用模型。
+            </div>
+            <div>
+              <div style={{ marginBottom: 8 }}>启用自定义 API</div>
+              <Switch
+                checked={apiConfigEnabled}
+                onChange={setApiConfigEnabled}
+                checkedChildren="开启"
+                unCheckedChildren="关闭"
+              />
+            </div>
+            <div>
+              <div style={{ marginBottom: 8 }}>API Key</div>
+              <Input.Password value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-..." autoComplete="off" />
+            </div>
+            <div>
+              <div style={{ marginBottom: 8 }}>代理地址 / Base URL（可选）</div>
+              <Input
+                value={apiBaseUrl}
+                onChange={(e) => setApiBaseUrl(e.target.value)}
+                placeholder="https://api.openai.com/v1"
+                autoComplete="off"
+              />
+            </div>
+            <div>
+              <div style={{ marginBottom: 8 }}>模型（可选）</div>
+              <Input
+                value={apiModel}
+                onChange={(e) => setApiModel(e.target.value)}
+                placeholder="gpt-4o-mini"
+                autoComplete="off"
+              />
+            </div>
+          </Space>
+        </Modal>
 
       </main>
     </div>

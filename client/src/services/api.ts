@@ -1,8 +1,16 @@
 import axios from 'axios'
+import { getFingerprintId } from '../utils/fingerprint'
 
 const api = axios.create({
   baseURL: '/api',
   timeout: 120000, // 增加超时时间以支持多模型博弈
+})
+
+api.interceptors.request.use(async (config) => {
+  const fingerprint = await getFingerprintId()
+  config.headers = config.headers ?? {}
+  ;(config.headers as any)['X-AAS-Fingerprint'] = fingerprint
+  return config
 })
 
 export interface SolveQuestionResponse {
@@ -10,6 +18,22 @@ export interface SolveQuestionResponse {
   question: string
   iterations?: number
   consensus?: boolean
+  tokensUsed?: number
+}
+
+export type UsageInfo = {
+  enabled: boolean
+  windowHours: number
+  limitTokens: number
+  usedTokens: number
+  remainingTokens: number
+  resetAtMs: number
+}
+
+export type ApiConfig = {
+  apiKey: string
+  baseUrl?: string
+  model?: string
 }
 
 export type StreamEvent =
@@ -21,6 +45,64 @@ export type StreamEvent =
   | { type: 'model2'; content: string; iteration?: number }
   | { type: 'status'; message: string; iteration?: number }
   | { type: 'error'; message: string }
+
+const parseResponseErrorMessage = async (response: Response) => {
+  const fallback = `请求失败（${response.status}）`
+  try {
+    const text = await response.text()
+    if (!text?.trim()) return fallback
+    try {
+      const data = JSON.parse(text) as any
+      return data?.error || data?.message || fallback
+    } catch {
+      return text
+    }
+  } catch {
+    return fallback
+  }
+}
+
+const toNumber = (value: string | null) => {
+  if (!value) return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+export const getUsageInfoFromHeaders = (headers: Headers): UsageInfo | null => {
+  const limitTokens = toNumber(headers.get('X-Usage-Limit-Tokens'))
+  const usedTokens = toNumber(headers.get('X-Usage-Used-Tokens'))
+  const remainingTokens = toNumber(headers.get('X-Usage-Remaining-Tokens'))
+  const resetAtMs = toNumber(headers.get('X-Usage-Reset-At'))
+  const windowHours = toNumber(headers.get('X-Usage-Window-Hours'))
+
+  if (
+    limitTokens === null ||
+    usedTokens === null ||
+    remainingTokens === null ||
+    resetAtMs === null ||
+    windowHours === null
+  ) {
+    return null
+  }
+
+  return {
+    enabled: limitTokens > 0,
+    windowHours,
+    limitTokens,
+    usedTokens,
+    remainingTokens,
+    resetAtMs
+  }
+}
+
+export const getUsage = async (): Promise<UsageInfo> => {
+  const fingerprint = await getFingerprintId()
+  const response = await fetch('/api/usage', { headers: { 'X-AAS-Fingerprint': fingerprint } })
+  if (!response.ok) {
+    throw new Error(await parseResponseErrorMessage(response))
+  }
+  return (await response.json()) as UsageInfo
+}
 
 export const solveQuestion = async (imageBlob: Blob, useDebate: boolean = false): Promise<SolveQuestionResponse> => {
   const formData = new FormData()
@@ -37,24 +119,39 @@ export const solveQuestion = async (imageBlob: Blob, useDebate: boolean = false)
   return response.data
 }
 
+const buildApiOverrideHeaders = (apiConfig?: ApiConfig) => {
+  if (!apiConfig?.apiKey) return {}
+  const headers: Record<string, string> = { 'X-AAS-Api-Key': apiConfig.apiKey }
+  if (apiConfig.baseUrl) headers['X-AAS-Base-Url'] = apiConfig.baseUrl
+  if (apiConfig.model) headers['X-AAS-Model'] = apiConfig.model
+  return headers
+}
+
 export const solveQuestionStream = async (
   imageBlob: Blob,
   useDebate: boolean,
-  onEvent: (event: StreamEvent) => void
+  onEvent: (event: StreamEvent) => void,
+  onUsage?: (usage: UsageInfo) => void,
+  apiConfig?: ApiConfig
 ): Promise<SolveQuestionResponse> => {
   const formData = new FormData()
   formData.append('image', imageBlob, 'question.jpg')
 
   const endpoint = useDebate ? '/solve-debate-stream' : '/solve-stream'
 
+  const fingerprint = await getFingerprintId()
   const response = await fetch(`/api${endpoint}`, {
     method: 'POST',
     body: formData,
+    headers: { 'X-AAS-Fingerprint': fingerprint, ...buildApiOverrideHeaders(apiConfig) }
   })
 
   if (!response.ok) {
-    throw new Error('流式请求失败')
+    throw new Error(await parseResponseErrorMessage(response))
   }
+
+  const usage = getUsageInfoFromHeaders(response.headers)
+  if (usage) onUsage?.(usage)
 
   if (!response.body) {
     return solveQuestion(imageBlob, useDebate)
@@ -133,7 +230,9 @@ export const solveQuestionMultiStream = async (
   imageBlobs: Blob[],
   useDebate: boolean,
   prompt: string | undefined,
-  onEvent: (event: StreamEvent) => void
+  onEvent: (event: StreamEvent) => void,
+  onUsage?: (usage: UsageInfo) => void,
+  apiConfig?: ApiConfig
 ): Promise<SolveQuestionResponse> => {
   const formData = new FormData()
   for (const [index, blob] of imageBlobs.entries()) {
@@ -145,14 +244,19 @@ export const solveQuestionMultiStream = async (
 
   const endpoint = useDebate ? '/solve-multi-debate-stream' : '/solve-multi-stream'
 
+  const fingerprint = await getFingerprintId()
   const response = await fetch(`/api${endpoint}`, {
     method: 'POST',
     body: formData,
+    headers: { 'X-AAS-Fingerprint': fingerprint, ...buildApiOverrideHeaders(apiConfig) }
   })
 
   if (!response.ok) {
-    throw new Error('流式请求失败')
+    throw new Error(await parseResponseErrorMessage(response))
   }
+
+  const usage = getUsageInfoFromHeaders(response.headers)
+  if (usage) onUsage?.(usage)
 
   if (!response.body) {
     // 目前仅实现了流式版本，多图情况下 body 不存在则直接报错

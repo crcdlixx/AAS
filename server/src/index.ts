@@ -1,10 +1,12 @@
-import express from 'express'
+import express, { type RequestHandler } from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
 import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
+import { createUsageLimiter, UsageLimitError } from './services/usageLimit.js'
+import { normalizeApiOverride, type ApiOverride } from './services/apiOverride.js'
 import {
   solveQuestion,
   solveQuestionFromImages,
@@ -26,6 +28,50 @@ const __dirname = path.dirname(__filename)
 
 const app = express()
 const PORT = process.env.PORT || 5174
+
+const usageLimiter = createUsageLimiter({
+  limitTokens: process.env.USAGE_LIMIT_TOKENS,
+  windowHours: process.env.USAGE_LIMIT_WINDOW_HOURS,
+  storePath: path.join(__dirname, '../usage-store.json')
+})
+
+const usageGuard: RequestHandler = (req, res, next) => {
+  const clientId = usageLimiter.getClientId(req)
+  ;(req as any).clientId = clientId
+
+  try {
+    const snap = usageLimiter.assertAllowed(clientId)
+    usageLimiter.setHeaders(res, snap)
+    next()
+  } catch (e) {
+    if (e instanceof UsageLimitError) {
+      usageLimiter.setHeaders(res, e.snapshot)
+      res.status(e.statusCode).json({
+        error: e.message,
+        enabled: e.snapshot.enabled,
+        limitTokens: e.snapshot.limitTokens,
+        usedTokens: e.snapshot.usedTokens,
+        remainingTokens: e.snapshot.remainingTokens,
+        resetAtMs: e.snapshot.resetAtMs
+      })
+      return
+    }
+    next(e)
+  }
+}
+
+const getApiOverrideFromRequest = (req: express.Request): ApiOverride | undefined => {
+  const getHeader = (name: string) => {
+    const value = (req.headers as any)[name]
+    return typeof value === 'string' ? value : Array.isArray(value) ? value[0] : undefined
+  }
+
+  const apiKey = getHeader('x-aas-api-key')
+  const baseURL = getHeader('x-aas-base-url')
+  const model = getHeader('x-aas-model')
+
+  return normalizeApiOverride({ apiKey, baseURL, model })
+}
 
 // 中间件
 app.use(cors())
@@ -76,24 +122,27 @@ const cleanupUploadedFiles = (files: Express.Multer.File[] | undefined) => {
 }
 
 // API路由 - 单模型解答
-app.post('/api/solve', upload.single('image'), async (req, res) => {
+app.post('/api/solve', usageGuard, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: '请上传图片文件' })
     }
 
     const imagePath = req.file.path
+    const clientId = (req as any).clientId as string
+    const apiOverride = getApiOverrideFromRequest(req)
     
     // 调用OpenAI API解答题目
-    const result = await solveQuestion(imagePath)
+    const result = await solveQuestion(imagePath, apiOverride)
+    const snap = usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
     
     // 删除临时文件
     fs.unlinkSync(imagePath)
     
     res.json(result)
   } catch (error) {
-    console.error('解答失败:', error)
-    
+    console.error('解答失败:', error instanceof Error ? error.message : error)
+
     // 清理文件
     if (req.file) {
       try {
@@ -111,21 +160,26 @@ app.post('/api/solve', upload.single('image'), async (req, res) => {
 })
 
 // API路由 - 单模型解答（多图）
-app.post('/api/solve-multi', upload.array('images', 20), async (req, res) => {
+app.post('/api/solve-multi', usageGuard, upload.array('images', 20), async (req, res) => {
   const files = (req.files as Express.Multer.File[]) || []
   try {
     if (!files.length) {
       return res.status(400).json({ error: '请上传图片文件' })
     }
 
+    const clientId = (req as any).clientId as string
+    const apiOverride = getApiOverrideFromRequest(req)
     const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
     const imagePaths = files.map((file) => file.path)
-    const result = await solveQuestionFromImages(imagePaths, prompt)
+    const result = await solveQuestionFromImages(imagePaths, prompt, apiOverride)
+    const snap = usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
 
     cleanupUploadedFiles(files)
+    usageLimiter.setHeaders(res, snap)
+    usageLimiter.setHeaders(res, snap)
     res.json(result)
   } catch (error) {
-    console.error('解答失败:', error)
+    console.error('解答失败:', error instanceof Error ? error.message : error)
     cleanupUploadedFiles(files)
     res.status(500).json({
       error: '解答失败，请重试',
@@ -135,12 +189,14 @@ app.post('/api/solve-multi', upload.array('images', 20), async (req, res) => {
 })
 
 // API路由 - 单模型解答（流式）
-app.post('/api/solve-stream', upload.single('image'), async (req, res) => {
+app.post('/api/solve-stream', usageGuard, upload.single('image'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: '请上传图片文件' })
   }
 
   const imagePath = req.file.path
+  const clientId = (req as any).clientId as string
+  const apiOverride = getApiOverrideFromRequest(req)
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
   res.setHeader('Cache-Control', 'no-cache, no-transform')
@@ -171,8 +227,9 @@ app.post('/api/solve-stream', upload.single('image'), async (req, res) => {
           send({ type: 'error', message: update.message })
           break
       }
-    })
+    }, apiOverride)
 
+    usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
     send({ type: 'final', result })
     res.end()
   } catch (error) {
@@ -188,12 +245,14 @@ app.post('/api/solve-stream', upload.single('image'), async (req, res) => {
 }) 
 
 // API路由 - 单模型解答（多图，流式）
-app.post('/api/solve-multi-stream', upload.array('images', 20), async (req, res) => {
+app.post('/api/solve-multi-stream', usageGuard, upload.array('images', 20), async (req, res) => {
   const files = (req.files as Express.Multer.File[]) || []
   if (!files.length) {
     return res.status(400).json({ error: '请上传图片文件' })
   }
 
+  const clientId = (req as any).clientId as string
+  const apiOverride = getApiOverrideFromRequest(req)
   const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
   const imagePaths = files.map((file) => file.path)
 
@@ -226,8 +285,9 @@ app.post('/api/solve-multi-stream', upload.array('images', 20), async (req, res)
           send({ type: 'error', message: update.message })
           break
       }
-    })
+    }, apiOverride)
 
+    usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
     send({ type: 'final', result })
     res.end()
   } catch (error) {
@@ -239,25 +299,28 @@ app.post('/api/solve-multi-stream', upload.array('images', 20), async (req, res)
 })
 
 // API路由 - 多模型博弈解答
-app.post('/api/solve-debate', upload.single('image'), async (req, res) => {
+app.post('/api/solve-debate', usageGuard, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: '请上传图片文件' })
     }
 
     const imagePath = req.file.path
+    const clientId = (req as any).clientId as string
+    const apiOverride = getApiOverrideFromRequest(req)
     const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
     
     // 调用多模型博弈系统
-    const result = await solveQuestionWithDebate(imagePath, maxIterations)
+    const result = await solveQuestionWithDebate(imagePath, maxIterations, apiOverride)
+    const snap = usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
     
     // 删除临时文件
     fs.unlinkSync(imagePath)
     
     res.json(result)
   } catch (error) {
-    console.error('多模型博弈失败:', error)
-    
+    console.error('多模型博弈失败:', error instanceof Error ? error.message : error)
+
     // 清理文件
     if (req.file) {
       try {
@@ -275,22 +338,26 @@ app.post('/api/solve-debate', upload.single('image'), async (req, res) => {
 })
 
 // API路由 - 多模型博弈解答（多图）
-app.post('/api/solve-multi-debate', upload.array('images', 20), async (req, res) => {
+app.post('/api/solve-multi-debate', usageGuard, upload.array('images', 20), async (req, res) => {
   const files = (req.files as Express.Multer.File[]) || []
   try {
     if (!files.length) {
       return res.status(400).json({ error: '请上传图片文件' })
     }
 
+    const clientId = (req as any).clientId as string
+    const apiOverride = getApiOverrideFromRequest(req)
     const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
     const imagePaths = files.map((file) => file.path)
     const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
-    const result = await solveQuestionWithDebateFromImages(imagePaths, maxIterations, prompt)
+    const result = await solveQuestionWithDebateFromImages(imagePaths, maxIterations, prompt, apiOverride)
+    const snap = usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
 
     cleanupUploadedFiles(files)
+    usageLimiter.setHeaders(res, snap)
     res.json(result)
   } catch (error) {
-    console.error('多模型博弈失败:', error)
+    console.error('多模型博弈失败:', error instanceof Error ? error.message : error)
     cleanupUploadedFiles(files)
     res.status(500).json({
       error: '多模型博弈失败，请重试',
@@ -300,12 +367,14 @@ app.post('/api/solve-multi-debate', upload.array('images', 20), async (req, res)
 })
 
 // API路由 - 多模型博弈解答（流式）
-app.post('/api/solve-debate-stream', upload.single('image'), async (req, res) => {
+app.post('/api/solve-debate-stream', usageGuard, upload.single('image'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: '请上传图片文件' })
   }
 
   const imagePath = req.file.path
+  const clientId = (req as any).clientId as string
+  const apiOverride = getApiOverrideFromRequest(req)
   const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
@@ -324,8 +393,9 @@ app.post('/api/solve-debate-stream', upload.single('image'), async (req, res) =>
   try {
     const result = await solveQuestionWithDebateStream(imagePath, maxIterations, (update) => {
       send(update)
-    })
+    }, apiOverride)
 
+    usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
     send({ type: 'final', result })
     res.end()
   } catch (error) {
@@ -341,12 +411,14 @@ app.post('/api/solve-debate-stream', upload.single('image'), async (req, res) =>
 }) 
 
 // API路由 - 多模型博弈解答（多图，流式）
-app.post('/api/solve-multi-debate-stream', upload.array('images', 20), async (req, res) => {
+app.post('/api/solve-multi-debate-stream', usageGuard, upload.array('images', 20), async (req, res) => {
   const files = (req.files as Express.Multer.File[]) || []
   if (!files.length) {
     return res.status(400).json({ error: '请上传图片文件' })
   }
 
+  const clientId = (req as any).clientId as string
+  const apiOverride = getApiOverrideFromRequest(req)
   const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
   const imagePaths = files.map((file) => file.path)
   const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
@@ -367,8 +439,9 @@ app.post('/api/solve-multi-debate-stream', upload.array('images', 20), async (re
   try {
     const result = await solveQuestionWithDebateStreamFromImages(imagePaths, maxIterations, prompt, (update) => {
       send(update)
-    })
+    }, apiOverride)
 
+    usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
     send({ type: 'final', result })
     res.end()
   } catch (error) {
@@ -382,6 +455,13 @@ app.post('/api/solve-multi-debate-stream', upload.array('images', 20), async (re
 // 健康检查
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() })
+})
+
+app.get('/api/usage', (req, res) => {
+  const clientId = usageLimiter.getClientId(req)
+  const snap = usageLimiter.snapshot(clientId)
+  usageLimiter.setHeaders(res, snap)
+  res.json(snap)
 })
 
 app.listen(PORT, () => {
