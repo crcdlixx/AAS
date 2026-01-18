@@ -1,5 +1,5 @@
 import { ChatOpenAI } from '@langchain/openai'
-import { HumanMessage } from '@langchain/core/messages'
+import { AIMessage, HumanMessage, SystemMessage } from '@langchain/core/messages'
 import fs from 'fs'
 import path from 'path'
 import dotenv from 'dotenv'
@@ -10,6 +10,13 @@ dotenv.config()
 
 export interface SolveResult {
   question: string
+  answer: string
+  tokensUsed?: number
+}
+
+export type FollowUpChatMessage = { role: 'user' | 'assistant'; content: string }
+
+export interface FollowUpResult {
   answer: string
   tokensUsed?: number
 }
@@ -62,6 +69,21 @@ const createModel = (streaming = false, apiOverride?: ApiOverride) => {
       baseURL: apiOverride?.baseURL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
     }
   })
+}
+
+const normalizeFollowUpHistory = (messages: unknown): FollowUpChatMessage[] => {
+  if (!Array.isArray(messages)) return []
+  const out: FollowUpChatMessage[] = []
+  for (const item of messages) {
+    if (!item || typeof item !== 'object') continue
+    const role = (item as any).role
+    const content = (item as any).content
+    if ((role !== 'user' && role !== 'assistant') || typeof content !== 'string') continue
+    const text = content.trim()
+    if (!text) continue
+    out.push({ role, content: text })
+  }
+  return out
 }
 
 type EncodedImage = { base64Image: string; mimeType: string }
@@ -228,6 +250,53 @@ export async function solveQuestionFromImages(
     console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
     throw new Error('AI解答失败，请检查API配置')
   }
+}
+
+export async function answerFollowUp(opts: {
+  baseQuestion: string
+  baseAnswer: string
+  prompt: string
+  messages?: unknown
+  apiOverride?: ApiOverride
+}): Promise<FollowUpResult> {
+  const baseQuestion = (opts.baseQuestion || '').trim()
+  const baseAnswer = (opts.baseAnswer || '').trim()
+  const prompt = (opts.prompt || '').trim()
+  if (!baseQuestion || !baseAnswer || !prompt) {
+    throw new Error('missing baseQuestion/baseAnswer/prompt')
+  }
+
+  const history = normalizeFollowUpHistory(opts.messages)
+  const model = createModel(false, opts.apiOverride)
+
+  const lcMessages: (SystemMessage | HumanMessage | AIMessage)[] = [
+    new SystemMessage(
+      '你是一个严谨、友好的中文学习助手。你将基于题目与已有解答，回答用户的后续追问；必要时可纠错并给出更清晰的推导步骤。'
+    ),
+    new HumanMessage(`题目：\n${baseQuestion}\n\n已给出的解答：\n${baseAnswer}`)
+  ]
+
+  for (const msg of history.slice(-20)) {
+    lcMessages.push(msg.role === 'user' ? new HumanMessage(msg.content) : new AIMessage(msg.content))
+  }
+
+  lcMessages.push(new HumanMessage(`用户追问：\n${prompt}`))
+
+  const response = await model.invoke(lcMessages)
+  const answer = (toText((response as any)?.content) || '').trim()
+  const tokensUsed =
+    extractTotalTokens(response) ??
+    estimateTokensFromText(baseQuestion) +
+      estimateTokensFromText(baseAnswer) +
+      estimateTokensFromText(history.map((m) => m.content).join('\n')) +
+      estimateTokensFromText(prompt) +
+      estimateTokensFromText(answer)
+
+  if (!answer) {
+    throw new Error('empty follow-up answer')
+  }
+
+  return { answer, tokensUsed }
 }
 
 function getMimeType(filePath: string): string {

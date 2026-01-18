@@ -12,13 +12,15 @@ import {
   solveQuestionFromImages,
   solveQuestionStream,
   solveQuestionStreamFromImages,
+  answerFollowUp,
   type StreamUpdate
 } from './services/openai.js'
 import {
   solveQuestionWithDebate,
   solveQuestionWithDebateFromImages,
   solveQuestionWithDebateStream,
-  solveQuestionWithDebateStreamFromImages
+  solveQuestionWithDebateStreamFromImages,
+  answerFollowUpWithDebate
 } from './services/debate.js'
 
 dotenv.config()
@@ -455,6 +457,46 @@ app.post('/api/solve-multi-debate-stream', usageGuard, upload.array('images', 20
 // 健康检查
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() })
+})
+
+app.post('/api/follow-up', usageGuard, async (req, res) => {
+  try {
+    const body: any = req.body || {}
+    const baseQuestion = typeof body.baseQuestion === 'string' ? body.baseQuestion : ''
+    const baseAnswer = typeof body.baseAnswer === 'string' ? body.baseAnswer : ''
+    const prompt = typeof body.prompt === 'string' ? body.prompt : ''
+    const mode = body.mode === 'debate' ? 'debate' : 'single'
+    const messages = body.messages
+
+    if (!baseQuestion.trim() || !baseAnswer.trim() || !prompt.trim()) {
+      return res.status(400).json({ error: 'baseQuestion/baseAnswer/prompt 不能为空' })
+    }
+
+    const clientId = (req as any).clientId as string
+    const apiOverride = getApiOverrideFromRequest(req)
+
+    const result =
+      mode === 'debate'
+        ? await answerFollowUpWithDebate({
+            baseQuestion,
+            baseAnswer,
+            prompt,
+            messages,
+            maxIterations: parseInt(process.env.MAX_DEBATE_ITERATIONS || '3', 10),
+            apiOverride
+          })
+        : await answerFollowUp({ baseQuestion, baseAnswer, prompt, messages, apiOverride })
+
+    const snap = usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
+    usageLimiter.setHeaders(res, snap)
+    res.json(result)
+  } catch (error) {
+    console.error('追问失败:', error instanceof Error ? error.message : error)
+    res.status(500).json({
+      error: '追问失败，请重试',
+      details: error instanceof Error ? error.message : '未知错误'
+    })
+  }
 })
 
 app.get('/api/usage', (req, res) => {

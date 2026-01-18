@@ -21,7 +21,16 @@ import { UploadOutlined, SendOutlined, TeamOutlined, UserOutlined, DeleteOutline
 import type { UploadFile } from 'antd'
 import MultiCropper, { CropBox, CropGroups, ModelMode } from './components/MultiCropper'
 import MarkdownView from './components/MarkdownView'
-import { getUsage, solveQuestionMultiStream, StreamEvent, SolveQuestionResponse, type ApiConfig, type UsageInfo } from './services/api'
+import {
+  followUpQuestion,
+  getUsage,
+  solveQuestionMultiStream,
+  StreamEvent,
+  SolveQuestionResponse,
+  type ApiConfig,
+  type FollowUpChatMessage,
+  type UsageInfo
+} from './services/api'
 import { cropToJpegBlobFromFile } from './utils/cropBlob'
 import logo from './assets/logo.png'
 import './App.css'
@@ -47,6 +56,15 @@ type SolveTask = {
   streamText: string
   result?: SolveQuestionResponse
   error?: string
+  followUps: FollowUpMessage[]
+  followUpDraft: string
+  followUpSending: boolean
+}
+
+type FollowUpMessage = FollowUpChatMessage & {
+  id: string
+  createdAt: number
+  status?: 'pending' | 'done' | 'error'
 }
 
 type CrossImageMergeOverride = {
@@ -306,6 +324,109 @@ function App() {
     })()
   }, [taskDrawerOpen])
 
+  const clearFollowUps = (taskId: string) => {
+    setTasks((prev) =>
+      prev.map((t) =>
+        t.id === taskId
+          ? {
+              ...t,
+              followUps: [],
+              followUpDraft: '',
+              followUpSending: false
+            }
+          : t
+      )
+    )
+  }
+
+  const sendFollowUp = async (taskId: string) => {
+    const task = tasks.find((t) => t.id === taskId)
+    if (!task?.result) return
+    if (apiConfigEnabled && !apiKey.trim()) {
+      message.error('已开启自定义 API，但未填写 API Key')
+      return
+    }
+
+    const prompt = task.followUpDraft.trim()
+    if (!prompt) return
+
+    const userMsg: FollowUpMessage = { id: createId(), role: 'user', content: prompt, createdAt: Date.now(), status: 'done' }
+    const assistantMsgId = createId()
+    const assistantMsg: FollowUpMessage = {
+      id: assistantMsgId,
+      role: 'assistant',
+      content: '',
+      createdAt: Date.now(),
+      status: 'pending'
+    }
+
+    const historyForApi: FollowUpChatMessage[] = task.followUps
+      .filter((m) => m.status !== 'pending')
+      .map((m) => ({ role: m.role, content: m.content }))
+      .slice(-20)
+
+    setTasks((prev) =>
+      prev.map((t) =>
+        t.id === taskId
+          ? {
+              ...t,
+              followUps: [...t.followUps, userMsg, assistantMsg],
+              followUpDraft: '',
+              followUpSending: true
+            }
+          : t
+      )
+    )
+
+    try {
+      const response = await followUpQuestion(
+        {
+          baseQuestion: task.result.question,
+          baseAnswer: task.result.answer,
+          prompt,
+          mode: task.mode,
+          messages: historyForApi
+        },
+        activeApiConfig
+      )
+
+      setTasks((prev) =>
+        prev.map((t) =>
+          t.id === taskId
+            ? {
+                ...t,
+                followUpSending: false,
+                followUps: t.followUps.map((m) =>
+                  m.id === assistantMsgId ? { ...m, content: response.answer, status: 'done' } : m
+                )
+              }
+            : t
+        )
+      )
+      try {
+        setUsageInfo(await getUsage())
+      } catch {
+        // ignore
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : '追问失败，请重试'
+      setTasks((prev) =>
+        prev.map((t) =>
+          t.id === taskId
+            ? {
+                ...t,
+                followUpSending: false,
+                followUps: t.followUps.map((m) =>
+                  m.id === assistantMsgId ? { ...m, content: errorMessage, status: 'error' } : m
+                )
+              }
+            : t
+        )
+      )
+      message.error(errorMessage)
+    }
+  }
+
   const solveActiveImage = async () => {
     if (!activeImage) return
     if (apiConfigEnabled && !apiKey.trim()) {
@@ -392,15 +513,18 @@ function App() {
       }
 
       const mode = groupCrops.find((x) => x.image.id === activeImage.id)?.crop.mode || activeImage.defaultMode
-      const task: SolveTask = {
-        id: createId(),
-        createdAt: Date.now(),
-        imageId: activeImage.id,
-        title,
-        mode,
-        status: 'running',
-        streamText: ''
-      }
+       const task: SolveTask = {
+         id: createId(),
+         createdAt: Date.now(),
+         imageId: activeImage.id,
+         title,
+         mode,
+         status: 'running',
+         streamText: '',
+         followUps: [],
+         followUpDraft: '',
+         followUpSending: false
+       }
       const prompt = buildPrompt(
         title,
         groupCrops.map((x) => ({ label: x.label, title: x.crop.title }))
@@ -682,6 +806,59 @@ function App() {
                           解答
                         </div>
                         <MarkdownView markdown={task.result.answer} className="task-result-content" />
+
+                        <div className="task-result-title" style={{ marginTop: 16 }}>
+                          继续提问
+                        </div>
+                        <div className="followup-thread">
+                          {task.followUps.length ? (
+                            task.followUps.map((m) => (
+                              <div key={m.id} className={`followup-msg ${m.role} ${m.status === 'error' ? 'error' : ''}`.trim()}>
+                                <div className="followup-meta">{m.role === 'user' ? '你' : 'AI'}</div>
+                                <div className="followup-bubble">
+                                  {m.role === 'assistant' ? (
+                                    <MarkdownView
+                                      markdown={m.content || (m.status === 'pending' ? '...' : '')}
+                                      className="followup-content"
+                                    />
+                                  ) : (
+                                    <div className="followup-content">{m.content}</div>
+                                  )}
+                                </div>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="followup-empty">可以在这里继续追问，比如“这题还有别的解法吗？”</div>
+                          )}
+                        </div>
+                        <Space.Compact style={{ width: '100%' }}>
+                          <Input
+                            placeholder="继续提问..."
+                            value={task.followUpDraft}
+                            onChange={(e) =>
+                              setTasks((prev) =>
+                                prev.map((t) => (t.id === task.id ? { ...t, followUpDraft: e.target.value } : t))
+                              )
+                            }
+                            onPressEnter={() => sendFollowUp(task.id)}
+                            disabled={task.followUpSending}
+                          />
+                          <Button
+                            type="primary"
+                            loading={task.followUpSending}
+                            disabled={!task.followUpDraft.trim() || task.followUpSending}
+                            onClick={() => sendFollowUp(task.id)}
+                          >
+                            发送
+                          </Button>
+                        </Space.Compact>
+                        {task.followUps.length > 0 && (
+                          <div style={{ marginTop: 8, textAlign: 'right' }}>
+                            <Button size="small" onClick={() => clearFollowUps(task.id)} disabled={task.followUpSending}>
+                              清空追问
+                            </Button>
+                          </div>
+                        )}
                         {typeof task.result.iterations === 'number' && (
                           <Space>
                             <Tag color="blue">迭代 {task.result.iterations} 次</Tag>

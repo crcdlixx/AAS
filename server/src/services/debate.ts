@@ -55,6 +55,140 @@ const createModels = (apiOverride?: ApiOverride): DebateModels => {
   return { model1, model2 }
 }
 
+export type FollowUpChatMessage = { role: 'user' | 'assistant'; content: string }
+
+export type FollowUpResult = {
+  answer: string
+  iterations: number
+  consensus: boolean
+  tokensUsed: number
+}
+
+type FollowUpState = {
+  baseQuestion: string
+  baseAnswer: string
+  history: FollowUpChatMessage[]
+  prompt: string
+  model1_answer: string
+  model2_review: string
+  iteration: number
+  max_iterations: number
+  consensus_reached: boolean
+  final_answer: string
+  tokens_used: number
+}
+
+const normalizeFollowUpHistory = (messages: unknown): FollowUpChatMessage[] => {
+  if (!Array.isArray(messages)) return []
+  const out: FollowUpChatMessage[] = []
+  for (const item of messages) {
+    if (!item || typeof item !== 'object') continue
+    const role = (item as any).role
+    const content = (item as any).content
+    if ((role !== 'user' && role !== 'assistant') || typeof content !== 'string') continue
+    const text = content.trim()
+    if (!text) continue
+    out.push({ role, content: text })
+  }
+  return out
+}
+
+const formatHistory = (history: FollowUpChatMessage[]) =>
+  history
+    .slice(-20)
+    .map((m) => `${m.role === 'user' ? '用户' : '助手'}：${m.content}`)
+    .join('\n')
+
+async function followUpModel1Propose(state: FollowUpState, models: DebateModels): Promise<FollowUpState> {
+  const { iteration, baseQuestion, baseAnswer, history, prompt, model1_answer, model2_review } = state
+  const historyText = formatHistory(history)
+
+  const text =
+    iteration === 0
+      ? `你是中文学习助手。请基于题目与已给出的解答，回答用户追问；必要时可纠错并补充推导/步骤。\n\n题目：\n${baseQuestion}\n\n已给出的解答：\n${baseAnswer}\n${
+          historyText ? `\n\n历史对话：\n${historyText}\n` : '\n'
+        }\n用户追问：\n${prompt}\n\n请直接给出回答。`
+      : `你正在改进上一轮对追问的回答。\n\n题目：\n${baseQuestion}\n\n已给出的解答：\n${baseAnswer}\n${
+          historyText ? `\n\n历史对话：\n${historyText}\n` : '\n'
+        }\n你上一轮的回答：\n${model1_answer}\n\n审查意见：\n${model2_review}\n\n请根据审查意见改进你的回答；如认为无需修改，请简要说明理由并给出更清晰的最终回答。`
+
+  const response = await models.model1.invoke([new HumanMessage(text)])
+  const answer = (response.content as string) || ''
+  state.tokens_used += extractTotalTokens(response) ?? estimateTokensFromText(answer)
+  state.model1_answer = answer
+  return state
+}
+
+async function followUpModel2Review(state: FollowUpState, models: DebateModels): Promise<FollowUpState> {
+  const { baseQuestion, baseAnswer, history, prompt, model1_answer } = state
+  const historyText = formatHistory(history)
+
+  const reviewPrompt = `你是严谨的审查员。请审查“助手回答”是否准确、有帮助，并且确实回应了“用户追问”。\n\n题目：\n${baseQuestion}\n\n已给出的解答：\n${baseAnswer}\n${
+    historyText ? `\n\n历史对话：\n${historyText}\n` : '\n'
+  }\n用户追问：\n${prompt}\n\n助手回答：\n${model1_answer}\n\n如果回答已经很好，请回复：\nAPPROVED: <一句话说明为什么好>\n\n如果需要改进，请指出具体问题与改进建议。`
+
+  const response = await models.model2.invoke([new HumanMessage(reviewPrompt)])
+  const review = (response.content as string) || ''
+  state.tokens_used += extractTotalTokens(response) ?? estimateTokensFromText(review)
+
+  state.model2_review = review
+  state.consensus_reached = review.toUpperCase().includes('APPROVED')
+  if (state.consensus_reached) {
+    state.final_answer = model1_answer
+  }
+  state.iteration += 1
+  return state
+}
+
+export async function answerFollowUpWithDebate(opts: {
+  baseQuestion: string
+  baseAnswer: string
+  prompt: string
+  maxIterations?: number
+  messages?: unknown
+  apiOverride?: ApiOverride
+}): Promise<FollowUpResult> {
+  const baseQuestion = (opts.baseQuestion || '').trim()
+  const baseAnswer = (opts.baseAnswer || '').trim()
+  const prompt = (opts.prompt || '').trim()
+  if (!baseQuestion || !baseAnswer || !prompt) {
+    throw new Error('missing baseQuestion/baseAnswer/prompt')
+  }
+
+  const maxIterations = Number.isFinite(opts.maxIterations) ? Math.max(1, Math.floor(opts.maxIterations as number)) : 3
+  const history = normalizeFollowUpHistory(opts.messages)
+  const models = createModels(opts.apiOverride)
+
+  let state: FollowUpState = {
+    baseQuestion,
+    baseAnswer,
+    history,
+    prompt,
+    model1_answer: '',
+    model2_review: '',
+    iteration: 0,
+    max_iterations: maxIterations,
+    consensus_reached: false,
+    final_answer: '',
+    tokens_used: 0
+  }
+
+  while (state.iteration < state.max_iterations && !state.consensus_reached) {
+    state = await followUpModel1Propose(state, models)
+    state = await followUpModel2Review(state, models)
+  }
+
+  const answer = (state.final_answer || state.model1_answer || '').trim()
+  if (!answer) throw new Error('empty follow-up answer')
+
+  return {
+    answer,
+    iterations: state.iteration,
+    consensus: state.consensus_reached,
+    tokensUsed: state.tokens_used
+  }
+}
+
 async function model1Propose(state: DebateState, models: DebateModels, onUpdate?: DebateUpdateHandler): Promise<DebateState> {
   const { iteration, images, extraPrompt, model1_answer, model2_review } = state
 

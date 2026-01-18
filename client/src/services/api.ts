@@ -21,6 +21,15 @@ export interface SolveQuestionResponse {
   tokensUsed?: number
 }
 
+export type FollowUpChatMessage = { role: 'user' | 'assistant'; content: string }
+
+export type FollowUpResponse = {
+  answer: string
+  tokensUsed?: number
+  iterations?: number
+  consensus?: boolean
+}
+
 export type UsageInfo = {
   enabled: boolean
   windowHours: number
@@ -125,6 +134,22 @@ const buildApiOverrideHeaders = (apiConfig?: ApiConfig) => {
   if (apiConfig.baseUrl) headers['X-AAS-Base-Url'] = apiConfig.baseUrl
   if (apiConfig.model) headers['X-AAS-Model'] = apiConfig.model
   return headers
+}
+
+export const followUpQuestion = async (
+  payload: {
+    baseQuestion: string
+    baseAnswer: string
+    prompt: string
+    mode?: 'single' | 'debate'
+    messages?: FollowUpChatMessage[]
+  },
+  apiConfig?: ApiConfig
+): Promise<FollowUpResponse> => {
+  const response = await api.post<FollowUpResponse>('/follow-up', payload, {
+    headers: { ...buildApiOverrideHeaders(apiConfig) }
+  })
+  return response.data
 }
 
 export const solveQuestionStream = async (
