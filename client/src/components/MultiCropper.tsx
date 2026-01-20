@@ -5,7 +5,7 @@ import { PlusOutlined, DeleteOutlined, LinkOutlined, DisconnectOutlined } from '
 import 'react-image-crop/dist/ReactCrop.css'
 import './MultiCropper.css'
 
-export type ModelMode = 'single' | 'debate'
+export type ModelMode = 'auto'
 
 export type CropBox = {
   id: string
@@ -286,9 +286,7 @@ function MultiCropper({ imageUrl, crops, groups, activeCropId, defaultMode, onCh
 
                   <div className="crop-item-meta">
                     <Tag color={item.groupId ? 'blue' : 'default'}>{groupLabel(item.groupId)}</Tag>
-                    <Tag color={item.mode === 'debate' ? 'green' : 'default'}>
-                      {item.mode === 'debate' ? '多模型' : '单模型'}
-                    </Tag>
+                    <Tag color="blue">自动路由</Tag>
                     <Tag color={hasBlob ? 'success' : 'warning'}>{hasBlob ? '已保存' : '未保存'}</Tag>
                   </div>
                 </div>

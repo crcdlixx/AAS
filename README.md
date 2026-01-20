@@ -15,7 +15,7 @@
 - Node.js + Express + TypeScript
 - Multer - 文件上传
 - OpenAI API - AI识别和解答
-- LangChain + LangGraph - 多模型博弈系统
+- LangChain + LangGraph - 自动路由/多模型编排
 
 ## 快速开始
 
@@ -35,8 +35,8 @@ copy .env.example .env
 ```
 
 编辑 `.env` 文件，填入你的API密钥。
-单模型模式可通过 `OPENAI_MODEL` 指定模型，默认 `gpt-4o`。
-如遇到单模型输出较长被截断，可在 `server/.env` 里设置 `OPENAI_MAX_TOKENS`（留空则不强制限制）。
+默认回答模型可通过 `OPENAI_MODEL` 指定，默认 `gpt-4o`。
+如遇到输出较长被截断，可在 `server/.env` 里设置 `OPENAI_MAX_TOKENS`（留空则不强制限制）。
 
 ### 3. 启动开发服务器
 
@@ -53,8 +53,7 @@ npm run dev
 - ✂️ 图片裁剪
 - 🤖 AI识别题目
 - 💡 智能解答
-- 🎯 **单模型模式** - 快速解答
-- 🔄 **多模型博弈模式** - 两个AI模型相互审查和改进答案，提高准确性
+- 🧭 **自动路由** - 先判断文科/理科，再按学科配置选择模型组合回答
 - 📱 响应式设计
 
 ## 项目结构
@@ -71,54 +70,15 @@ npm run dev
 ```
 
 
-## 多模型博弈系统
+## 自动路由机制
 
-### 什么是多模型博弈？
+自动路由会先用“路由模型”判断题目属于文科/理科，然后按学科配置选择合适的模型组合进行解答（可能是单模型，也可能是双模型审查）。
 
-多模型博弈模式使用两个不同的AI模型相互审查和改进答案：
-
-1. **模型1** 首先识别题目并给出解答
-2. **模型2** 审查模型1的答案，提出改进建议
-3. **模型1** 根据审查意见改进答案
-4. 重复步骤2-3，直到：
-   - 模型2认为答案已经很好（达成共识）
-   - 或达到最大迭代次数
-
-### 优势
-
-- ✅ 更高的准确性 - 两个模型互相纠错
-- ✅ 更完整的解答 - 多次迭代补充遗漏
-- ✅ 更好的逻辑性 - 相互审查提升质量
-
-### 配置
-
-在 `server/.env` 中配置两个模型：
-
-```env
-# 模型1 - 用于提出答案
-MODEL1_NAME=gpt-4o-mini
-MODEL1_API_KEY=your_api_key
-MODEL1_BASE_URL=https://api.openai.com/v1
-
-# 模型2 - 用于审查答案
-MODEL2_NAME=gpt-4o
-MODEL2_API_KEY=your_api_key
-MODEL2_BASE_URL=https://api.openai.com/v1
-
-# 最大迭代次数
-MAX_DEBATE_ITERATIONS=3
-```
-
-你可以使用：
-- 相同的API密钥但不同的模型
-- 不同的API提供商（如OpenAI、Azure、本地模型等）
-- 任何兼容OpenAI格式的API
+配置示例见 `server/.env.example`（`ROUTER_*` / `ROUTE_*` / `MODEL1_*` / `MODEL2_*`）。
 
 ## 使用说明
 
 1. 上传包含题目的图片
 2. 裁剪题目区域
-3. 选择解答模式：
-   - **单模型模式**：快速获得答案
-   - **多模型博弈模式**：获得更准确、更完整的答案
+3. 点击“自动路由解答”
 4. 查看AI解答结果

@@ -5,6 +5,7 @@ import path from 'path'
 import dotenv from 'dotenv'
 import { estimateTokensFromText, extractTotalTokens } from './tokenUsage.js'
 import type { ApiOverride } from './apiOverride.js'
+import type { DebateModelsOverride } from './router.js'
 
 dotenv.config()
 
@@ -32,24 +33,36 @@ type DebateUpdateHandler = (update: DebateStreamUpdate) => void
 
 type DebateModels = { model1: ChatOpenAI; model2: ChatOpenAI }
 
-const createModels = (apiOverride?: ApiOverride): DebateModels => {
+const clean = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
+
+const createModels = (apiOverride?: ApiOverride, modelsOverride?: DebateModelsOverride): DebateModels => {
   const defaultKey = process.env.OPENAI_API_KEY
   const overrideKey = apiOverride?.apiKey
   const overrideBase = apiOverride?.baseURL
   const overrideModel = apiOverride?.model
 
+  const model1Override = modelsOverride?.model1
+  const model2Override = modelsOverride?.model2
+
+  const model1Name = clean(overrideModel) || clean(model1Override?.modelName) || process.env.MODEL1_NAME || 'gpt-4o-mini'
+  const model2Name = clean(overrideModel) || clean(model2Override?.modelName) || process.env.MODEL2_NAME || 'gpt-4o'
+
   const model1 = new ChatOpenAI({
-    modelName: overrideModel || process.env.MODEL1_NAME || 'gpt-4o-mini',
+    modelName: model1Name,
     temperature: 0.7,
-    openAIApiKey: overrideKey || process.env.MODEL1_API_KEY || defaultKey,
-    configuration: { baseURL: overrideBase || process.env.MODEL1_BASE_URL || 'https://api.openai.com/v1' }
+    openAIApiKey: overrideKey || clean(model1Override?.apiKey) || process.env.MODEL1_API_KEY || defaultKey,
+    configuration: {
+      baseURL: overrideBase || clean(model1Override?.baseURL) || process.env.MODEL1_BASE_URL || 'https://api.openai.com/v1'
+    }
   })
 
   const model2 = new ChatOpenAI({
-    modelName: overrideModel || process.env.MODEL2_NAME || 'gpt-4o',
+    modelName: model2Name,
     temperature: 0.7,
-    openAIApiKey: overrideKey || process.env.MODEL2_API_KEY || defaultKey,
-    configuration: { baseURL: overrideBase || process.env.MODEL2_BASE_URL || 'https://api.openai.com/v1' }
+    openAIApiKey: overrideKey || clean(model2Override?.apiKey) || process.env.MODEL2_API_KEY || defaultKey,
+    configuration: {
+      baseURL: overrideBase || clean(model2Override?.baseURL) || process.env.MODEL2_BASE_URL || 'https://api.openai.com/v1'
+    }
   })
 
   return { model1, model2 }
@@ -147,6 +160,7 @@ export async function answerFollowUpWithDebate(opts: {
   maxIterations?: number
   messages?: unknown
   apiOverride?: ApiOverride
+  modelsOverride?: DebateModelsOverride
 }): Promise<FollowUpResult> {
   const baseQuestion = (opts.baseQuestion || '').trim()
   const baseAnswer = (opts.baseAnswer || '').trim()
@@ -157,7 +171,7 @@ export async function answerFollowUpWithDebate(opts: {
 
   const maxIterations = Number.isFinite(opts.maxIterations) ? Math.max(1, Math.floor(opts.maxIterations as number)) : 3
   const history = normalizeFollowUpHistory(opts.messages)
-  const models = createModels(opts.apiOverride)
+  const models = createModels(opts.apiOverride, opts.modelsOverride)
 
   let state: FollowUpState = {
     baseQuestion,
@@ -290,15 +304,21 @@ ${model1_answer}
   return state
 }
 
-export async function solveQuestionWithDebate(imagePath: string, maxIterations: number = 3, apiOverride?: ApiOverride) {
-  return solveQuestionWithDebateFromImages([imagePath], maxIterations, undefined, apiOverride)
+export async function solveQuestionWithDebate(
+  imagePath: string,
+  maxIterations: number = 3,
+  apiOverride?: ApiOverride,
+  modelsOverride?: DebateModelsOverride
+) {
+  return solveQuestionWithDebateFromImages([imagePath], maxIterations, undefined, apiOverride, modelsOverride)
 }
 
 export async function solveQuestionWithDebateFromImages(
   imagePaths: string[],
   maxIterations: number = 3,
   extraPrompt?: string,
-  apiOverride?: ApiOverride
+  apiOverride?: ApiOverride,
+  modelsOverride?: DebateModelsOverride
 ) {
   try {
     console.log(`\n${'='.repeat(60)}`)
@@ -311,7 +331,7 @@ export async function solveQuestionWithDebateFromImages(
       mimeType: getMimeType(p)
     }))
 
-    const models = createModels(apiOverride)
+    const models = createModels(apiOverride, modelsOverride)
     let state: DebateState = {
       question: '识别并解答图片中的题目',
       images,
@@ -364,9 +384,10 @@ export async function solveQuestionWithDebateStream(
   imagePath: string,
   maxIterations: number = 3,
   onUpdate?: DebateUpdateHandler,
-  apiOverride?: ApiOverride
+  apiOverride?: ApiOverride,
+  modelsOverride?: DebateModelsOverride
 ) {
-  return solveQuestionWithDebateStreamFromImages([imagePath], maxIterations, undefined, onUpdate, apiOverride)
+  return solveQuestionWithDebateStreamFromImages([imagePath], maxIterations, undefined, onUpdate, apiOverride, modelsOverride)
 }
 
 export async function solveQuestionWithDebateStreamFromImages(
@@ -374,7 +395,8 @@ export async function solveQuestionWithDebateStreamFromImages(
   maxIterations: number = 3,
   extraPrompt?: string,
   onUpdate?: DebateUpdateHandler,
-  apiOverride?: ApiOverride
+  apiOverride?: ApiOverride,
+  modelsOverride?: DebateModelsOverride
 ) {
   try {
     console.log(`\n${'='.repeat(60)}`)
@@ -387,7 +409,7 @@ export async function solveQuestionWithDebateStreamFromImages(
       mimeType: getMimeType(p)
     }))
 
-    const models = createModels(apiOverride)
+    const models = createModels(apiOverride, modelsOverride)
     let state: DebateState = {
       question: '识别并解答图片中的题目',
       images,

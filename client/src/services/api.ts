@@ -19,6 +19,11 @@ export interface SolveQuestionResponse {
   iterations?: number
   consensus?: boolean
   tokensUsed?: number
+  routedMode?: 'single' | 'debate'
+  routedSubject?: 'humanities' | 'science' | 'unknown'
+  routerModel?: string
+  routerConfidence?: number
+  routerTokensUsed?: number
 }
 
 export type FollowUpChatMessage = { role: 'user' | 'assistant'; content: string }
@@ -113,11 +118,11 @@ export const getUsage = async (): Promise<UsageInfo> => {
   return (await response.json()) as UsageInfo
 }
 
-export const solveQuestion = async (imageBlob: Blob, useDebate: boolean = false): Promise<SolveQuestionResponse> => {
+export const solveQuestion = async (imageBlob: Blob): Promise<SolveQuestionResponse> => {
   const formData = new FormData()
   formData.append('image', imageBlob, 'question.jpg')
 
-  const endpoint = useDebate ? '/solve-debate' : '/solve'
+  const endpoint = '/solve-auto'
   
   const response = await api.post<SolveQuestionResponse>(endpoint, formData, {
     headers: {
@@ -143,6 +148,7 @@ export const followUpQuestion = async (
     prompt: string
     mode?: 'single' | 'debate'
     messages?: FollowUpChatMessage[]
+    routedSubject?: 'humanities' | 'science' | 'unknown'
   },
   apiConfig?: ApiConfig
 ): Promise<FollowUpResponse> => {
@@ -154,7 +160,6 @@ export const followUpQuestion = async (
 
 export const solveQuestionStream = async (
   imageBlob: Blob,
-  useDebate: boolean,
   onEvent: (event: StreamEvent) => void,
   onUsage?: (usage: UsageInfo) => void,
   apiConfig?: ApiConfig
@@ -162,7 +167,7 @@ export const solveQuestionStream = async (
   const formData = new FormData()
   formData.append('image', imageBlob, 'question.jpg')
 
-  const endpoint = useDebate ? '/solve-debate-stream' : '/solve-stream'
+  const endpoint = '/solve-auto-stream'
 
   const fingerprint = await getFingerprintId()
   const response = await fetch(`/api${endpoint}`, {
@@ -179,7 +184,7 @@ export const solveQuestionStream = async (
   if (usage) onUsage?.(usage)
 
   if (!response.body) {
-    return solveQuestion(imageBlob, useDebate)
+    return solveQuestion(imageBlob)
   }
 
   const reader = response.body.getReader()
@@ -253,7 +258,6 @@ export const solveQuestionStream = async (
 
 export const solveQuestionMultiStream = async (
   imageBlobs: Blob[],
-  useDebate: boolean,
   prompt: string | undefined,
   onEvent: (event: StreamEvent) => void,
   onUsage?: (usage: UsageInfo) => void,
@@ -267,7 +271,7 @@ export const solveQuestionMultiStream = async (
     formData.append('prompt', prompt)
   }
 
-  const endpoint = useDebate ? '/solve-multi-debate-stream' : '/solve-multi-stream'
+  const endpoint = '/solve-multi-auto-stream'
 
   const fingerprint = await getFingerprintId()
   const response = await fetch(`/api${endpoint}`, {

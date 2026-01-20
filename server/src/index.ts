@@ -16,6 +16,15 @@ import {
   type StreamUpdate
 } from './services/openai.js'
 import {
+  applyModelOverride,
+  getSubjectDebateModelsOverride,
+  getSubjectSingleModelOverride,
+  routeQuestionFromImages,
+  type RouteDecision,
+  type RouteMode,
+  type RouteSubject
+} from './services/router.js'
+import {
   solveQuestionWithDebate,
   solveQuestionWithDebateFromImages,
   solveQuestionWithDebateStream,
@@ -123,185 +132,29 @@ const cleanupUploadedFiles = (files: Express.Multer.File[] | undefined) => {
   }
 }
 
-// API路由 - 单模型解答
-app.post('/api/solve', usageGuard, upload.single('image'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: '请上传图片文件' })
-    }
+const subjectLabel = (subject: RouteSubject) => {
+  if (subject === 'science') return '理科'
+  if (subject === 'humanities') return '文科'
+  return '不确定'
+}
 
-    const imagePath = req.file.path
-    const clientId = (req as any).clientId as string
-    const apiOverride = getApiOverrideFromRequest(req)
-    
-    // 调用OpenAI API解答题目
-    const result = await solveQuestion(imagePath, apiOverride)
-    const snap = usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
-    
-    // 删除临时文件
-    fs.unlinkSync(imagePath)
-    
-    res.json(result)
-  } catch (error) {
-    console.error('解答失败:', error instanceof Error ? error.message : error)
+const modeLabel = (mode: RouteMode) => (mode === 'debate' ? '双模型审查' : '单模型')
 
-    // 清理文件
-    if (req.file) {
-      try {
-        fs.unlinkSync(req.file.path)
-      } catch (e) {
-        console.error('删除临时文件失败:', e)
-      }
-    }
-    
-    res.status(500).json({ 
-      error: '解答失败，请重试',
-      details: error instanceof Error ? error.message : '未知错误'
-    })
+const attachRouting = (result: any, decision: RouteDecision) => {
+  const baseTokens = typeof result?.tokensUsed === 'number' ? result.tokensUsed : 0
+  return {
+    ...result,
+    routedSubject: decision.subject,
+    routedMode: decision.mode,
+    routerModel: decision.routerModel,
+    routerConfidence: decision.confidence,
+    routerTokensUsed: decision.routerTokensUsed,
+    tokensUsed: baseTokens + decision.routerTokensUsed
   }
-})
+}
 
-// API路由 - 单模型解答（多图）
-app.post('/api/solve-multi', usageGuard, upload.array('images', 20), async (req, res) => {
-  const files = (req.files as Express.Multer.File[]) || []
-  try {
-    if (!files.length) {
-      return res.status(400).json({ error: '请上传图片文件' })
-    }
-
-    const clientId = (req as any).clientId as string
-    const apiOverride = getApiOverrideFromRequest(req)
-    const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
-    const imagePaths = files.map((file) => file.path)
-    const result = await solveQuestionFromImages(imagePaths, prompt, apiOverride)
-    const snap = usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
-
-    cleanupUploadedFiles(files)
-    usageLimiter.setHeaders(res, snap)
-    usageLimiter.setHeaders(res, snap)
-    res.json(result)
-  } catch (error) {
-    console.error('解答失败:', error instanceof Error ? error.message : error)
-    cleanupUploadedFiles(files)
-    res.status(500).json({
-      error: '解答失败，请重试',
-      details: error instanceof Error ? error.message : '未知错误'
-    })
-  }
-})
-
-// API路由 - 单模型解答（流式）
-app.post('/api/solve-stream', usageGuard, upload.single('image'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: '请上传图片文件' })
-  }
-
-  const imagePath = req.file.path
-  const clientId = (req as any).clientId as string
-  const apiOverride = getApiOverrideFromRequest(req)
-
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
-  res.setHeader('Cache-Control', 'no-cache, no-transform')
-  res.setHeader('Connection', 'keep-alive')
-  res.flushHeaders()
-
-  const resAny = res as any
-  const send = (payload: unknown) => {
-    res.write(`data: ${JSON.stringify(payload)}\n\n`)
-    if (typeof resAny.flush === 'function') {
-      resAny.flush()
-    }
-  }
-
-  try {
-    const result = await solveQuestionStream(imagePath, (update: StreamUpdate) => {
-      switch (update.type) {
-        case 'start':
-          send({ type: 'start' })
-          break
-        case 'delta':
-          send({ type: 'delta', value: update.value })
-          break
-        case 'complete':
-          send({ type: 'complete', value: update.value, result: update.result })
-          break
-        case 'error':
-          send({ type: 'error', message: update.message })
-          break
-      }
-    }, apiOverride)
-
-    usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
-    send({ type: 'final', result })
-    res.end()
-  } catch (error) {
-    send({ type: 'error', message: error instanceof Error ? error.message : '未知错误' })
-    res.end()
-  } finally {
-    try {
-      fs.unlinkSync(imagePath)
-    } catch (e) {
-      console.error('删除临时文件失败:', e)
-    }
-  }
-}) 
-
-// API路由 - 单模型解答（多图，流式）
-app.post('/api/solve-multi-stream', usageGuard, upload.array('images', 20), async (req, res) => {
-  const files = (req.files as Express.Multer.File[]) || []
-  if (!files.length) {
-    return res.status(400).json({ error: '请上传图片文件' })
-  }
-
-  const clientId = (req as any).clientId as string
-  const apiOverride = getApiOverrideFromRequest(req)
-  const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
-  const imagePaths = files.map((file) => file.path)
-
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
-  res.setHeader('Cache-Control', 'no-cache, no-transform')
-  res.setHeader('Connection', 'keep-alive')
-  res.flushHeaders()
-
-  const resAny = res as any
-  const send = (payload: unknown) => {
-    res.write(`data: ${JSON.stringify(payload)}\n\n`)
-    if (typeof resAny.flush === 'function') {
-      resAny.flush()
-    }
-  }
-
-  try {
-    const result = await solveQuestionStreamFromImages(imagePaths, prompt, (update: StreamUpdate) => {
-      switch (update.type) {
-        case 'start':
-          send({ type: 'start' })
-          break
-        case 'delta':
-          send({ type: 'delta', value: update.value })
-          break
-        case 'complete':
-          send({ type: 'complete', value: update.value, result: update.result })
-          break
-        case 'error':
-          send({ type: 'error', message: update.message })
-          break
-      }
-    }, apiOverride)
-
-    usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
-    send({ type: 'final', result })
-    res.end()
-  } catch (error) {
-    send({ type: 'error', message: error instanceof Error ? error.message : '未知错误' })
-    res.end()
-  } finally {
-    cleanupUploadedFiles(files)
-  }
-})
-
-// API路由 - 多模型博弈解答
-app.post('/api/solve-debate', usageGuard, upload.single('image'), async (req, res) => {
+// API路由 - 自动路由解答（单图）
+app.post('/api/solve-auto', usageGuard, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: '请上传图片文件' })
@@ -311,19 +164,25 @@ app.post('/api/solve-debate', usageGuard, upload.single('image'), async (req, re
     const clientId = (req as any).clientId as string
     const apiOverride = getApiOverrideFromRequest(req)
     const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
-    
-    // 调用多模型博弈系统
-    const result = await solveQuestionWithDebate(imagePath, maxIterations, apiOverride)
-    const snap = usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
-    
-    // 删除临时文件
-    fs.unlinkSync(imagePath)
-    
-    res.json(result)
-  } catch (error) {
-    console.error('多模型博弈失败:', error instanceof Error ? error.message : error)
 
-    // 清理文件
+    const decision = await routeQuestionFromImages([imagePath], undefined, apiOverride)
+    const answerOverride = applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
+    const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
+
+    const result =
+      decision.mode === 'debate'
+        ? await solveQuestionWithDebate(imagePath, maxIterations, apiOverride, debateModelsOverride)
+        : await solveQuestion(imagePath, answerOverride)
+
+    const enriched = attachRouting(result, decision)
+    const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
+
+    fs.unlinkSync(imagePath)
+    usageLimiter.setHeaders(res, snap)
+    res.json(enriched)
+  } catch (error) {
+    console.error('自动路由解答失败:', error instanceof Error ? error.message : error)
+
     if (req.file) {
       try {
         fs.unlinkSync(req.file.path)
@@ -331,16 +190,16 @@ app.post('/api/solve-debate', usageGuard, upload.single('image'), async (req, re
         console.error('删除临时文件失败:', e)
       }
     }
-    
-    res.status(500).json({ 
-      error: '多模型博弈失败，请重试',
+
+    res.status(500).json({
+      error: '自动路由解答失败，请重试',
       details: error instanceof Error ? error.message : '未知错误'
     })
   }
 })
 
-// API路由 - 多模型博弈解答（多图）
-app.post('/api/solve-multi-debate', usageGuard, upload.array('images', 20), async (req, res) => {
+// API路由 - 自动路由解答（多图）
+app.post('/api/solve-multi-auto', usageGuard, upload.array('images', 20), async (req, res) => {
   const files = (req.files as Express.Multer.File[]) || []
   try {
     if (!files.length) {
@@ -352,24 +211,34 @@ app.post('/api/solve-multi-debate', usageGuard, upload.array('images', 20), asyn
     const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
     const imagePaths = files.map((file) => file.path)
     const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
-    const result = await solveQuestionWithDebateFromImages(imagePaths, maxIterations, prompt, apiOverride)
-    const snap = usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
+
+    const decision = await routeQuestionFromImages(imagePaths, prompt, apiOverride)
+    const answerOverride = applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
+    const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
+
+    const result =
+      decision.mode === 'debate'
+        ? await solveQuestionWithDebateFromImages(imagePaths, maxIterations, prompt, apiOverride, debateModelsOverride)
+        : await solveQuestionFromImages(imagePaths, prompt, answerOverride)
+
+    const enriched = attachRouting(result, decision)
+    const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
 
     cleanupUploadedFiles(files)
     usageLimiter.setHeaders(res, snap)
-    res.json(result)
+    res.json(enriched)
   } catch (error) {
-    console.error('多模型博弈失败:', error instanceof Error ? error.message : error)
+    console.error('自动路由解答失败:', error instanceof Error ? error.message : error)
     cleanupUploadedFiles(files)
     res.status(500).json({
-      error: '多模型博弈失败，请重试',
+      error: '自动路由解答失败，请重试',
       details: error instanceof Error ? error.message : '未知错误'
     })
   }
 })
 
-// API路由 - 多模型博弈解答（流式）
-app.post('/api/solve-debate-stream', usageGuard, upload.single('image'), async (req, res) => {
+// API路由 - 自动路由解答（单图，流式）
+app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: '请上传图片文件' })
   }
@@ -393,12 +262,43 @@ app.post('/api/solve-debate-stream', usageGuard, upload.single('image'), async (
   }
 
   try {
-    const result = await solveQuestionWithDebateStream(imagePath, maxIterations, (update) => {
-      send(update)
-    }, apiOverride)
+    const decision = await routeQuestionFromImages([imagePath], undefined, apiOverride)
+    const routeMessage = `路由结果：${subjectLabel(decision.subject)} → ${modeLabel(decision.mode)}${
+      typeof decision.confidence === 'number' ? `（置信度 ${decision.confidence.toFixed(2)}）` : ''
+    }`
+    const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
 
-    usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
-    send({ type: 'final', result })
+    const result =
+      decision.mode === 'debate'
+        ? (send({ type: 'status', message: routeMessage }),
+          await solveQuestionWithDebateStream(
+            imagePath,
+            maxIterations,
+            (update) => send(update),
+            apiOverride,
+            debateModelsOverride
+          ))
+        : await solveQuestionStream(imagePath, (update: StreamUpdate) => {
+            switch (update.type) {
+              case 'start':
+                send({ type: 'start' })
+                send({ type: 'status', message: routeMessage })
+                break
+              case 'delta':
+                send({ type: 'delta', value: update.value })
+                break
+              case 'complete':
+                send({ type: 'complete', value: update.value, result: update.result })
+                break
+              case 'error':
+                send({ type: 'error', message: update.message })
+                break
+            }
+          }, applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject)))
+
+    const enriched = attachRouting(result, decision)
+    usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
+    send({ type: 'final', result: enriched })
     res.end()
   } catch (error) {
     send({ type: 'error', message: error instanceof Error ? error.message : '未知错误' })
@@ -410,10 +310,10 @@ app.post('/api/solve-debate-stream', usageGuard, upload.single('image'), async (
       console.error('删除临时文件失败:', e)
     }
   }
-}) 
+})
 
-// API路由 - 多模型博弈解答（多图，流式）
-app.post('/api/solve-multi-debate-stream', usageGuard, upload.array('images', 20), async (req, res) => {
+// API路由 - 自动路由解答（多图，流式）
+app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20), async (req, res) => {
   const files = (req.files as Express.Multer.File[]) || []
   if (!files.length) {
     return res.status(400).json({ error: '请上传图片文件' })
@@ -439,12 +339,49 @@ app.post('/api/solve-multi-debate-stream', usageGuard, upload.array('images', 20
   }
 
   try {
-    const result = await solveQuestionWithDebateStreamFromImages(imagePaths, maxIterations, prompt, (update) => {
-      send(update)
-    }, apiOverride)
+    const decision = await routeQuestionFromImages(imagePaths, prompt, apiOverride)
+    const routeMessage = `路由结果：${subjectLabel(decision.subject)} → ${modeLabel(decision.mode)}${
+      typeof decision.confidence === 'number' ? `（置信度 ${decision.confidence.toFixed(2)}）` : ''
+    }`
+    const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
 
-    usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
-    send({ type: 'final', result })
+    const result =
+      decision.mode === 'debate'
+        ? (send({ type: 'status', message: routeMessage }),
+          await solveQuestionWithDebateStreamFromImages(
+            imagePaths,
+            maxIterations,
+            prompt,
+            (update) => send(update),
+            apiOverride,
+            debateModelsOverride
+          ))
+        : await solveQuestionStreamFromImages(
+            imagePaths,
+            prompt,
+            (update: StreamUpdate) => {
+              switch (update.type) {
+                case 'start':
+                  send({ type: 'start' })
+                  send({ type: 'status', message: routeMessage })
+                  break
+                case 'delta':
+                  send({ type: 'delta', value: update.value })
+                  break
+                case 'complete':
+                  send({ type: 'complete', value: update.value, result: update.result })
+                  break
+                case 'error':
+                  send({ type: 'error', message: update.message })
+                  break
+              }
+            },
+            applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
+          )
+
+    const enriched = attachRouting(result, decision)
+    usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
+    send({ type: 'final', result: enriched })
     res.end()
   } catch (error) {
     send({ type: 'error', message: error instanceof Error ? error.message : '未知错误' })
@@ -467,6 +404,11 @@ app.post('/api/follow-up', usageGuard, async (req, res) => {
     const prompt = typeof body.prompt === 'string' ? body.prompt : ''
     const mode = body.mode === 'debate' ? 'debate' : 'single'
     const messages = body.messages
+    const routedSubjectRaw = body.routedSubject
+    const routedSubject: RouteSubject | undefined =
+      routedSubjectRaw === 'science' || routedSubjectRaw === 'humanities' || routedSubjectRaw === 'unknown'
+        ? routedSubjectRaw
+        : undefined
 
     if (!baseQuestion.trim() || !baseAnswer.trim() || !prompt.trim()) {
       return res.status(400).json({ error: 'baseQuestion/baseAnswer/prompt 不能为空' })
@@ -483,7 +425,8 @@ app.post('/api/follow-up', usageGuard, async (req, res) => {
             prompt,
             messages,
             maxIterations: parseInt(process.env.MAX_DEBATE_ITERATIONS || '3', 10),
-            apiOverride
+            apiOverride,
+            modelsOverride: routedSubject ? getSubjectDebateModelsOverride(routedSubject) : undefined
           })
         : await answerFollowUp({ baseQuestion, baseAnswer, prompt, messages, apiOverride })
 

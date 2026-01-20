@@ -6,7 +6,6 @@ import {
   message,
   Switch,
   Space,
-  Tooltip,
   Tabs,
   Drawer,
   Collapse,
@@ -17,7 +16,7 @@ import {
   Progress,
   Input
 } from 'antd'
-import { UploadOutlined, SendOutlined, TeamOutlined, UserOutlined, DeleteOutlined, DownloadOutlined, LinkOutlined } from '@ant-design/icons'
+import { UploadOutlined, SendOutlined, DeleteOutlined, DownloadOutlined, LinkOutlined } from '@ant-design/icons'
 import type { UploadFile } from 'antd'
 import MultiCropper, { CropBox, CropGroups, ModelMode } from './components/MultiCropper'
 import MarkdownView from './components/MarkdownView'
@@ -86,7 +85,7 @@ function App() {
   const [tasks, setTasks] = useState<SolveTask[]>([])
   const [taskDrawerOpen, setTaskDrawerOpen] = useState(false)
   const [exportingMd, setExportingMd] = useState(false)
-  const [globalMode, setGlobalMode] = useState<ModelMode>('single')
+  const globalMode: ModelMode = 'auto'
   const [usageInfo, setUsageInfo] = useState<UsageInfo | null>(null)
   const [apiConfigOpen, setApiConfigOpen] = useState(false)
   const [apiConfigEnabled, setApiConfigEnabled] = useState(false)
@@ -249,7 +248,6 @@ function App() {
       }
       const response = await solveQuestionMultiStream(
         blobs,
-        task.mode === 'debate',
         prompt,
         (event: StreamEvent) => {
         setTasks((prev) =>
@@ -299,7 +297,7 @@ function App() {
       } catch {
         // ignore
       }
-      message.success(task.mode === 'debate' ? '多模型博弈完成！' : 'AI解答完成！')
+      message.success('自动路由完成！')
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : '解答失败，请重试'
       setTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, status: 'error', error: errorMessage } : t)))
@@ -379,13 +377,15 @@ function App() {
     )
 
     try {
+      const followUpMode = (task.result as any)?.routedMode === 'debate' ? 'debate' : 'single'
       const response = await followUpQuestion(
         {
           baseQuestion: task.result.question,
           baseAnswer: task.result.answer,
           prompt,
-          mode: task.mode,
-          messages: historyForApi
+          mode: followUpMode,
+          messages: historyForApi,
+          routedSubject: (task.result as any)?.routedSubject
         },
         activeApiConfig
       )
@@ -550,7 +550,18 @@ function App() {
 
       for (const task of completed) {
         lines.push(`## ${task.title}`)
-        lines.push(`- 模式：${task.mode === 'debate' ? '多模型博弈' : '单模型'}`)
+        const baseModeLabel = '自动路由'
+        const routedSubject = (task.result as any)?.routedSubject
+        const routedMode = (task.result as any)?.routedMode
+        const routedSubjectLabel =
+          routedSubject === 'science' ? '理科' : routedSubject === 'humanities' ? '文科' : routedSubject ? '不确定' : ''
+        const routedModeLabel =
+          routedMode === 'debate' ? '双模型' : routedMode === 'single' ? '单模型' : routedMode ? String(routedMode) : ''
+        const routeSuffix =
+          routedSubjectLabel || routedModeLabel
+            ? `（${routedSubjectLabel}${routedModeLabel ? `→${routedModeLabel}` : ''}）`
+            : ''
+        lines.push(`- 模式：${baseModeLabel}${routeSuffix}`)
         lines.push(`- 时间：${new Date(task.createdAt).toLocaleString()}`)
         lines.push('')
         lines.push('### 题目')
@@ -628,16 +639,7 @@ function App() {
               activeKey={activeImageId}
               onChange={setActiveImageId}
               items={images.map((img) => {
-                const activeCrop = img.crops.find((c) => c.id === img.activeCropId) || img.crops[0]
-                const activeMode = activeCrop?.mode || img.defaultMode
-                const modeSet = new Set(img.crops.map((c) => c.mode))
-                const summaryMode = modeSet.size === 1 ? (modeSet.has('debate') ? 'debate' : 'single') : 'mixed'
-                const actionLabel =
-                  summaryMode === 'debate'
-                    ? '开始多模型博弈'
-                    : summaryMode === 'single'
-                    ? '发送给 AI 解答'
-                    : '开始解答（含单/多模型）'
+                const actionLabel = '自动路由解答'
 
                 return {
                   key: img.id,
@@ -646,39 +648,9 @@ function App() {
                     <div className="workspace">
                       <div className="workspace-toolbar">
                         <Space direction="vertical" size="small">
-                          <Space>
-                            <Tooltip title="单模型模式使用一个AI模型快速解答">
-                              <UserOutlined className={activeMode === 'single' ? 'mode-icon active' : 'mode-icon muted'} />
-                            </Tooltip>
-                            <Switch
-                              checked={activeMode === 'debate'}
-                              onChange={(checked) => {
-                                const nextMode: ModelMode = checked ? 'debate' : 'single'
-                                setGlobalMode(nextMode)
-                                updateImage(img.id, (prev) => {
-                                  const selected =
-                                    prev.crops.find((c) => c.id === prev.activeCropId) || prev.crops[0]
-                                  if (!selected) {
-                                    return { ...prev, defaultMode: nextMode }
-                                  }
-                                  const groupKey = selected.groupId || selected.id
-                                  const nextCrops = prev.crops.map((c) =>
-                                    (c.groupId || c.id) === groupKey ? { ...c, mode: nextMode } : c
-                                  )
-                                  return { ...prev, defaultMode: nextMode, crops: nextCrops }
-                                })
-                              }}
-                              checkedChildren="多模型博弈"
-                              unCheckedChildren="单模型"
-                            />
-                            <Tooltip title="多模型博弈模式让两个AI模型相互审查和改进答案，提高准确性">
-                              <TeamOutlined className={activeMode === 'debate' ? 'mode-icon active' : 'mode-icon muted'} />
-                            </Tooltip>
-                          </Space>
                           <div className="mode-hint">
-                            当前题目为{activeMode === 'debate' ? '多模型' : '单模型'}，新增题目默认使用该模式
+                            当前模式：自动路由（先判断文科/理科，再选择合适的模型组合）
                           </div>
-                          {activeMode === 'debate' && <div className="mode-hint">两个AI模型将相互审查与改进答案</div>}
                         </Space>
 
                         <Space wrap>
@@ -769,14 +741,24 @@ function App() {
             items={tasks.map((task) => {
               const statusColor =
                 task.status === 'done' ? 'success' : task.status === 'error' ? 'error' : task.status === 'running' ? 'processing' : 'default'
-              const modeLabel = task.mode === 'debate' ? '多模型' : '单模型'
+              const modeLabel = '自动'
+              const modeColor = 'blue'
+              const routedSubject = (task.result as any)?.routedSubject
+              const routedMode = (task.result as any)?.routedMode
+              const routedLabel =
+                routedSubject || routedMode
+                  ? `${routedSubject === 'science' ? '理科' : routedSubject === 'humanities' ? '文科' : '不确定'}→${
+                      routedMode === 'debate' ? '双模型' : routedMode === 'single' ? '单模型' : '未知'
+                    }`
+                  : ''
               return {
                 key: task.id,
                 label: (
                   <div className="task-label">
                     <span className="task-title">{task.title}</span>
                     <Space size="small">
-                      <Tag color="blue">{modeLabel}</Tag>
+                      <Tag color={modeColor}>{modeLabel}</Tag>
+                      {!!routedLabel && <Tag color="geekblue">{routedLabel}</Tag>}
                       {typeof task.result?.tokensUsed === 'number' && <Tag color="purple">{task.result.tokensUsed} tokens</Tag>}
                       <Tag color={statusColor}>{task.status}</Tag>
                     </Space>
