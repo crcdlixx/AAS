@@ -76,6 +76,8 @@ npm run dev
 
 配置示例见 `server/.env.example`（`ROUTER_*` / `ROUTE_*` / `MODEL1_*` / `MODEL2_*`）。
 
+理科题会尝试调用 MCP 工具 `execute_python` 做计算/验算；随项目启动的 MCP 服务在 `tools/mcp_python`，详见 `docs/mcp/README.md`。
+
 ## 使用说明
 
 1. 上传包含题目的图片

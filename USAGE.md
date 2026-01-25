@@ -113,6 +113,15 @@ npm run dev
 - 前端：http://localhost:5173
 - 后端：http://localhost:5174
 
+### 4. MCP 工具服务（理科用）
+
+理科题会尝试调用 MCP 工具 `execute_python` 进行计算/验算。
+
+本仓库已内置 MCP Python 服务：`tools/mcp_python`，根目录 `npm run dev` 会自动启动它；默认地址为：
+
+- 默认地址：`http://127.0.0.1:8080/method/execute_python`
+- 后端配置：`server/.env` 里设置 `MCP_PYTHON_URL` / `MCP_PYTHON_ENABLED`
+
 ## 使用流程
 
 ### 1. 上传图片

@@ -1,0 +1,30 @@
+{
+  "name": "mcp-pyodide-python",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "An MCP server that runs Python via Pyodide (with scientific computing libraries).",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/http.js",
+    "start:stdio": "node dist/index.js",
+    "smoke": "node dist/smoke.js",
+    "http-smoke": "node dist/httpSmoke.js",
+    "mcp-smoke": "node dist/mcpSmoke.js",
+    "dev": "node --watch dist/http.js",
+    "dev:stdio": "node --watch dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ai-question-solver": "file:../..",
+    "pyodide": "^0.26.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "typescript": "^5.5.4"
+  }
+}

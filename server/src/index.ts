@@ -24,6 +24,7 @@ import {
   type RouteMode,
   type RouteSubject
 } from './services/router.js'
+import { enrichScienceAnswerWithMcp, withScienceMcpHint } from './services/scienceMcp.js'
 import {
   solveQuestionWithDebate,
   solveQuestionWithDebateFromImages,
@@ -168,13 +169,26 @@ app.post('/api/solve-auto', usageGuard, upload.single('image'), async (req, res)
     const decision = await routeQuestionFromImages([imagePath], undefined, apiOverride)
     const answerOverride = applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
+    const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
 
     const result =
       decision.mode === 'debate'
         ? await solveQuestionWithDebate(imagePath, maxIterations, apiOverride, debateModelsOverride)
         : await solveQuestion(imagePath, answerOverride)
 
-    const enriched = attachRouting(result, decision)
+    const enrichedResult =
+      scienceMcpEnabled
+        ? await (async () => {
+            const mcp = await enrichScienceAnswerWithMcp({ question: result.question, answer: result.answer, apiOverride })
+            return {
+              ...result,
+              answer: mcp.answer,
+              tokensUsed: (result as any)?.tokensUsed ? (result as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
+            }
+          })()
+        : result
+
+    const enriched = attachRouting(enrichedResult, decision)
     const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
 
     fs.unlinkSync(imagePath)
@@ -208,20 +222,34 @@ app.post('/api/solve-multi-auto', usageGuard, upload.array('images', 20), async 
 
     const clientId = (req as any).clientId as string
     const apiOverride = getApiOverrideFromRequest(req)
-    const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
+    const promptRaw = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
     const imagePaths = files.map((file) => file.path)
     const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
 
-    const decision = await routeQuestionFromImages(imagePaths, prompt, apiOverride)
+    const decision = await routeQuestionFromImages(imagePaths, promptRaw, apiOverride)
     const answerOverride = applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
+    const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
+    const prompt = scienceMcpEnabled ? withScienceMcpHint(promptRaw) : promptRaw
 
     const result =
       decision.mode === 'debate'
         ? await solveQuestionWithDebateFromImages(imagePaths, maxIterations, prompt, apiOverride, debateModelsOverride)
         : await solveQuestionFromImages(imagePaths, prompt, answerOverride)
 
-    const enriched = attachRouting(result, decision)
+    const enrichedResult =
+      scienceMcpEnabled
+        ? await (async () => {
+            const mcp = await enrichScienceAnswerWithMcp({ question: result.question, answer: result.answer, apiOverride })
+            return {
+              ...result,
+              answer: mcp.answer,
+              tokensUsed: (result as any)?.tokensUsed ? (result as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
+            }
+          })()
+        : result
+
+    const enriched = attachRouting(enrichedResult, decision)
     const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
 
     cleanupUploadedFiles(files)
@@ -267,6 +295,7 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
       typeof decision.confidence === 'number' ? `（置信度 ${decision.confidence.toFixed(2)}）` : ''
     }`
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
+    const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
 
     const result =
       decision.mode === 'debate'
@@ -296,7 +325,20 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
             }
           }, applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject)))
 
-    const enriched = attachRouting(result, decision)
+    const enrichedResult =
+      scienceMcpEnabled
+        ? await (async () => {
+            send({ type: 'status', message: '理科：调用 MCP 工具中...' })
+            const mcp = await enrichScienceAnswerWithMcp({ question: result.question, answer: result.answer, apiOverride })
+            return {
+              ...result,
+              answer: mcp.answer,
+              tokensUsed: (result as any)?.tokensUsed ? (result as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
+            }
+          })()
+        : result
+
+    const enriched = attachRouting(enrichedResult, decision)
     usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
     send({ type: 'final', result: enriched })
     res.end()
@@ -321,7 +363,7 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
 
   const clientId = (req as any).clientId as string
   const apiOverride = getApiOverrideFromRequest(req)
-  const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
+  const promptRaw = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined
   const imagePaths = files.map((file) => file.path)
   const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
 
@@ -339,11 +381,13 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
   }
 
   try {
-    const decision = await routeQuestionFromImages(imagePaths, prompt, apiOverride)
+    const decision = await routeQuestionFromImages(imagePaths, promptRaw, apiOverride)
     const routeMessage = `路由结果：${subjectLabel(decision.subject)} → ${modeLabel(decision.mode)}${
       typeof decision.confidence === 'number' ? `（置信度 ${decision.confidence.toFixed(2)}）` : ''
     }`
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
+    const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
+    const prompt = scienceMcpEnabled ? withScienceMcpHint(promptRaw) : promptRaw
 
     const result =
       decision.mode === 'debate'
@@ -379,7 +423,20 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
             applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
           )
 
-    const enriched = attachRouting(result, decision)
+    const enrichedResult =
+      scienceMcpEnabled
+        ? await (async () => {
+            send({ type: 'status', message: '理科：调用 MCP 工具中...' })
+            const mcp = await enrichScienceAnswerWithMcp({ question: result.question, answer: result.answer, apiOverride })
+            return {
+              ...result,
+              answer: mcp.answer,
+              tokensUsed: (result as any)?.tokensUsed ? (result as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
+            }
+          })()
+        : result
+
+    const enriched = attachRouting(enrichedResult, decision)
     usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
     send({ type: 'final', result: enriched })
     res.end()
