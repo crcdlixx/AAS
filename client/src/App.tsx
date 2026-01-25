@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Upload,
   Button,
@@ -14,14 +14,17 @@ import {
   Modal,
   Select,
   Progress,
-  Input
+  Input,
+  AutoComplete
 } from 'antd'
 import { UploadOutlined, SendOutlined, DeleteOutlined, DownloadOutlined, LinkOutlined } from '@ant-design/icons'
 import type { UploadFile } from 'antd'
 import MultiCropper, { CropBox, CropGroups, ModelMode } from './components/MultiCropper'
 import MarkdownView from './components/MarkdownView'
+import KnowledgeBasePanel from './components/KnowledgeBasePanel'
 import {
   followUpQuestion,
+  getAvailableModels,
   getUsage,
   solveQuestionMultiStream,
   StreamEvent,
@@ -30,6 +33,7 @@ import {
   type FollowUpChatMessage,
   type UsageInfo
 } from './services/api'
+import { listFiles, type KnowledgeBaseFile } from './services/knowledgeBaseApi'
 import { cropToJpegBlobFromFile } from './utils/cropBlob'
 import logo from './assets/logo.png'
 import './App.css'
@@ -85,18 +89,23 @@ function App() {
   const [tasks, setTasks] = useState<SolveTask[]>([])
   const [taskDrawerOpen, setTaskDrawerOpen] = useState(false)
   const [exportingMd, setExportingMd] = useState(false)
-  const globalMode: ModelMode = 'auto'
+  const [globalMode, setGlobalMode] = useState<ModelMode>('auto')
   const [usageInfo, setUsageInfo] = useState<UsageInfo | null>(null)
   const [apiConfigOpen, setApiConfigOpen] = useState(false)
   const [apiConfigEnabled, setApiConfigEnabled] = useState(false)
   const [apiKey, setApiKey] = useState('')
   const [apiBaseUrl, setApiBaseUrl] = useState('')
   const [apiModel, setApiModel] = useState('')
+  const [availableModels, setAvailableModels] = useState<string[]>([])
+  const [availableModelsLoading, setAvailableModelsLoading] = useState(false)
+  const [customAvailableModels, setCustomAvailableModels] = useState<string[]>([])
+  const fileImportRef = useRef<HTMLInputElement | null>(null)
   const [crossImageMergeEnabled, setCrossImageMergeEnabled] = useState(true)
   const [crossImageMergeOverrides, setCrossImageMergeOverrides] = useState<Record<string, CrossImageMergeOverride>>({})
   const [crossImageMergeModalOpen, setCrossImageMergeModalOpen] = useState(false)
   const [mergeFromCropId, setMergeFromCropId] = useState<string>('')
   const [mergeToCropId, setMergeToCropId] = useState<string>('')
+  const [knowledgeBaseFiles, setKnowledgeBaseFiles] = useState<KnowledgeBaseFile[]>([])
 
   const activeImage = useMemo(() => images.find((img) => img.id === activeImageId), [images, activeImageId])
   const activeImageIndex = useMemo(() => images.findIndex((img) => img.id === activeImageId), [images, activeImageId])
@@ -114,6 +123,72 @@ function App() {
     const model = apiModel.trim()
     return { apiKey: key, baseUrl: baseUrl || undefined, model: model || undefined }
   }, [apiConfigEnabled, apiKey, apiBaseUrl, apiModel])
+
+  const refreshAvailableModels = useCallback(async () => {
+    setAvailableModelsLoading(true)
+    try {
+      const models = await getAvailableModels()
+      setAvailableModels(models)
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : '获取模型列表失败')
+    } finally {
+      setAvailableModelsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!apiConfigOpen) return
+    refreshAvailableModels()
+  }, [apiConfigOpen, refreshAvailableModels])
+
+  const exportApiConfig = () => {
+    const payload = {
+      enabled: apiConfigEnabled,
+      apiKey: apiKey.trim(),
+      baseUrl: apiBaseUrl.trim() || undefined,
+      model: apiModel.trim() || undefined,
+      availableModels: customAvailableModels
+    }
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'aas-api-config.json'
+    a.click()
+    URL.revokeObjectURL(url)
+    message.success('已导出配置（包含 API Key）')
+  }
+
+  const importApiConfigFromFile = async (file: File) => {
+    const text = await file.text()
+    let data: any
+    try {
+      data = JSON.parse(text)
+    } catch {
+      message.error('配置文件不是有效的 JSON')
+      return
+    }
+
+    const enabled = typeof data.enabled === 'boolean' ? data.enabled : apiConfigEnabled
+    const importedKey = typeof data.apiKey === 'string' ? data.apiKey : ''
+    const importedBase =
+      typeof data.baseUrl === 'string'
+        ? data.baseUrl
+        : typeof data.baseURL === 'string'
+          ? data.baseURL
+          : ''
+    const importedModel = typeof data.model === 'string' ? data.model : ''
+    const importedAvailableModels = Array.isArray(data.availableModels)
+      ? data.availableModels.filter((x: unknown) => typeof x === 'string').map((x: string) => x.trim()).filter(Boolean)
+      : []
+
+    setApiConfigEnabled(enabled)
+    setApiKey(importedKey)
+    setApiBaseUrl(importedBase)
+    setApiModel(importedModel)
+    setCustomAvailableModels(importedAvailableModels)
+    message.success('已导入配置')
+  }
 
   const handleUpload = (file: File) => {
     const id = createId()
@@ -278,7 +353,8 @@ function App() {
         )
         },
         (u) => setUsageInfo(u),
-        activeApiConfig
+        activeApiConfig,
+        task.mode
       )
 
       setTasks((prev) =>
@@ -321,6 +397,17 @@ function App() {
       }
     })()
   }, [taskDrawerOpen])
+
+  useEffect(() => {
+    ;(async () => {
+      try {
+        const result = await listFiles()
+        setKnowledgeBaseFiles(result.files)
+      } catch {
+        // ignore
+      }
+    })()
+  }, [])
 
   const clearFollowUps = (taskId: string) => {
     setTasks((prev) =>
@@ -502,6 +589,63 @@ function App() {
     for (const [groupId, groupRefs] of groups) {
       const groupCrops = [...groupRefs].sort((a, b) => a.order - b.order)
       const title = activeImage.groups[groupId] || groupCrops.find((x) => x.image.id === activeImage.id)?.crop.title || '题目'
+
+      // Check for mode conflicts
+      const uniqueModes = [...new Set(groupCrops.map((gc) => gc.crop.mode))]
+      let selectedMode: ModelMode
+
+      if (uniqueModes.length > 1) {
+        // Show modal to let user choose mode
+        const modeChoice = await new Promise<ModelMode | null>((resolve) => {
+          Modal.confirm({
+            title: '模式冲突',
+            content: (
+              <div>
+                <p>该组裁剪框包含不同的解题模式：</p>
+                <ul>
+                  {uniqueModes.map((mode) => (
+                    <li key={mode}>
+                      {mode === 'auto' ? '🔄 自动路由' : mode === 'single' ? '⚡ 单模型' : '🔍 双模型审查'}
+                    </li>
+                  ))}
+                </ul>
+                <p>请选择使用哪种模式：</p>
+                <Select
+                  defaultValue={uniqueModes[0]}
+                  style={{ width: '100%' }}
+                  onChange={(value) => {
+                    // Store the selected value temporarily
+                    (Modal as any)._selectedMode = value
+                  }}
+                  options={uniqueModes.map((mode) => ({
+                    value: mode,
+                    label: mode === 'auto' ? '🔄 自动路由（推荐）' : mode === 'single' ? '⚡ 单模型' : '🔍 双模型审查'
+                  }))}
+                />
+              </div>
+            ),
+            onOk: () => {
+              resolve((Modal as any)._selectedMode || uniqueModes[0])
+              delete (Modal as any)._selectedMode
+            },
+            onCancel: () => {
+              resolve(null)
+              delete (Modal as any)._selectedMode
+            },
+            okText: '确定',
+            cancelText: '取消'
+          })
+        })
+
+        if (modeChoice === null) {
+          // User cancelled
+          return
+        }
+        selectedMode = modeChoice
+      } else {
+        selectedMode = uniqueModes[0]
+      }
+
       const blobs: Blob[] = []
       for (const ref of groupCrops) {
         const blob = await ensureBlob(ref.image, ref.crop)
@@ -512,16 +656,15 @@ function App() {
         blobs.push(blob)
       }
 
-      const mode = groupCrops.find((x) => x.image.id === activeImage.id)?.crop.mode || activeImage.defaultMode
-       const task: SolveTask = {
-         id: createId(),
-         createdAt: Date.now(),
-         imageId: activeImage.id,
-         title,
-         mode,
-         status: 'running',
-         streamText: '',
-         followUps: [],
+      const task: SolveTask = {
+        id: createId(),
+        createdAt: Date.now(),
+        imageId: activeImage.id,
+        title,
+        mode: selectedMode,
+        status: 'running',
+        streamText: '',
+        followUps: [],
          followUpDraft: '',
          followUpSending: false
        }
@@ -623,6 +766,11 @@ function App() {
             <p className="ant-upload-text">点击或拖拽多张图片到此区域上传</p>
             <p className="ant-upload-hint">支持 JPG、PNG、WebP 等图片格式</p>
           </Upload.Dragger>
+
+          <div style={{ marginTop: 16 }}>
+            <KnowledgeBasePanel files={knowledgeBaseFiles} onFilesChange={setKnowledgeBaseFiles} />
+          </div>
+
           <div className="action-buttons" style={{ justifyContent: 'space-between' }}>
             <Button onClick={() => setApiConfigOpen(true)}>自定义 API（临时）{apiConfigEnabled ? '：已开启' : ''}</Button>
             {images.length > 0 && (
@@ -639,7 +787,12 @@ function App() {
               activeKey={activeImageId}
               onChange={setActiveImageId}
               items={images.map((img) => {
-                const actionLabel = '自动路由解答'
+                const actionLabel =
+                  globalMode === 'single'
+                    ? '单模型解答'
+                    : globalMode === 'debate'
+                      ? '双模型审查解答'
+                      : '自动路由解答'
 
                 return {
                   key: img.id,
@@ -647,9 +800,24 @@ function App() {
                   children: (
                     <div className="workspace">
                       <div className="workspace-toolbar">
-                        <Space direction="vertical" size="small">
-                          <div className="mode-hint">
-                            当前模式：自动路由（先判断文科/理科，再选择合适的模型组合）
+                        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+                          <div>
+                            <span style={{ marginRight: 8, fontWeight: 500 }}>全局解题模式：</span>
+                            <Select
+                              value={globalMode}
+                              onChange={setGlobalMode}
+                              style={{ width: 200 }}
+                              options={[
+                                { value: 'auto', label: '🔄 自动路由（推荐）' },
+                                { value: 'single', label: '⚡ 单模型' },
+                                { value: 'debate', label: '🔍 双模型审查' }
+                              ]}
+                            />
+                          </div>
+                          <div className="mode-hint" style={{ fontSize: 12, color: '#666' }}>
+                            {globalMode === 'auto' && '先判断文科/理科，再选择合适的模型组合'}
+                            {globalMode === 'single' && '使用单个模型快速解答'}
+                            {globalMode === 'debate' && '使用两个模型互相审查，提高准确性'}
                           </div>
                         </Space>
 
@@ -741,8 +909,8 @@ function App() {
             items={tasks.map((task) => {
               const statusColor =
                 task.status === 'done' ? 'success' : task.status === 'error' ? 'error' : task.status === 'running' ? 'processing' : 'default'
-              const modeLabel = '自动'
-              const modeColor = 'blue'
+              const modeLabel = task.mode === 'auto' ? '自动' : task.mode === 'single' ? '单模型' : '双模型'
+              const modeColor = task.mode === 'auto' ? 'blue' : task.mode === 'single' ? 'green' : 'purple'
               const routedSubject = (task.result as any)?.routedSubject
               const routedMode = (task.result as any)?.routedMode
               const routedLabel =
@@ -932,6 +1100,10 @@ function App() {
           onCancel={() => setApiConfigOpen(false)}
           footer={
             <Space>
+              <Button onClick={() => fileImportRef.current?.click()}>导入</Button>
+              <Button icon={<DownloadOutlined />} onClick={exportApiConfig}>
+                导出
+              </Button>
               <Button
                 danger
                 onClick={() => {
@@ -947,6 +1119,18 @@ function App() {
             </Space>
           }
         >
+          <input
+            ref={fileImportRef}
+            type="file"
+            accept="application/json"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              e.target.value = ''
+              if (!file) return
+              importApiConfigFromFile(file)
+            }}
+          />
           <Space direction="vertical" style={{ width: '100%' }} size="middle">
             <div style={{ color: 'rgba(0,0,0,0.45)' }}>
               仅本次页面会话生效，不会写入本地存储；刷新页面会丢失。API Key 会随请求发送到本服务端用于调用模型。
@@ -974,13 +1158,40 @@ function App() {
               />
             </div>
             <div>
-              <div style={{ marginBottom: 8 }}>模型（可选）</div>
-              <Input
-                value={apiModel}
-                onChange={(e) => setApiModel(e.target.value)}
-                placeholder="gpt-4o-mini"
-                autoComplete="off"
+              <Space align="center" style={{ width: '100%', justifyContent: 'space-between' }}>
+                <div style={{ marginBottom: 8 }}>模型（可选）</div>
+                <Button size="small" loading={availableModelsLoading} onClick={refreshAvailableModels}>
+                  刷新模型列表
+                </Button>
+              </Space>
+              <Select
+                mode="tags"
+                value={customAvailableModels}
+                onChange={setCustomAvailableModels}
+                tokenSeparators={[',']}
+                placeholder="可用模型列表（可选，逗号分隔）。例如：gpt-4o,gpt-4o-mini"
+                style={{ width: '100%', marginBottom: 8 }}
+                options={[...new Set([...customAvailableModels, ...availableModels])].map((m) => ({ value: m, label: m }))}
               />
+              <AutoComplete
+                value={apiModel}
+                onChange={setApiModel}
+                placeholder="gpt-4o-mini"
+                options={[...new Set([...customAvailableModels, ...availableModels])].map((m) => ({ value: m, label: m }))}
+                filterOption={(input, option) =>
+                  (option?.value ?? '')
+                    .toString()
+                    .toLowerCase()
+                    .includes(input.toLowerCase())
+                }
+              />
+              {customAvailableModels.length > 0 ? (
+                <div style={{ marginTop: 6, color: 'rgba(0,0,0,0.45)' }}>当前优先使用你填写的“可用模型列表”。</div>
+              ) : availableModels.length > 0 ? (
+                <div style={{ marginTop: 6, color: 'rgba(0,0,0,0.45)' }}>
+                  可用模型来自服务端 `.env`（`AAS_MODEL_LIST` 或自动汇总）。
+                </div>
+              ) : null}
             </div>
           </Space>
         </Modal>

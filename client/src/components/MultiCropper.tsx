@@ -1,11 +1,11 @@
 import { useMemo, useRef, useState } from 'react'
 import ReactCrop, { Crop, PixelCrop } from 'react-image-crop'
-import { Button, Checkbox, Divider, Input, Modal, Space, Tag, Typography, message } from 'antd'
+import { Button, Checkbox, Divider, Input, Modal, Select, Space, Tag, Typography, message } from 'antd'
 import { PlusOutlined, DeleteOutlined, LinkOutlined, DisconnectOutlined } from '@ant-design/icons'
 import 'react-image-crop/dist/ReactCrop.css'
 import './MultiCropper.css'
 
-export type ModelMode = 'auto'
+export type ModelMode = 'single' | 'debate' | 'auto'
 
 export type CropBox = {
   id: string
@@ -284,9 +284,29 @@ function MultiCropper({ imageUrl, crops, groups, activeCropId, defaultMode, onCh
                     }
                   />
 
+                  <Select
+                    value={item.mode}
+                    onChange={(mode) =>
+                      setCrops(
+                        crops.map((c) => (c.id === item.id ? { ...c, mode } : c)),
+                        groups,
+                        activeCropId
+                      )
+                    }
+                    size="small"
+                    style={{ width: '100%', marginTop: 4 }}
+                    options={[
+                      { value: 'auto', label: '自动' },
+                      { value: 'single', label: '单模型' },
+                      { value: 'debate', label: '双模型' }
+                    ]}
+                  />
+
                   <div className="crop-item-meta">
                     <Tag color={item.groupId ? 'blue' : 'default'}>{groupLabel(item.groupId)}</Tag>
-                    <Tag color="blue">自动路由</Tag>
+                    <Tag color={item.mode === 'auto' ? 'blue' : item.mode === 'single' ? 'green' : 'purple'}>
+                      {item.mode === 'auto' ? '自动路由' : item.mode === 'single' ? '单模型' : '双模型'}
+                    </Tag>
                     <Tag color={hasBlob ? 'success' : 'warning'}>{hasBlob ? '已保存' : '未保存'}</Tag>
                   </div>
                 </div>

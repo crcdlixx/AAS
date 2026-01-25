@@ -21,6 +21,7 @@ export interface SolveQuestionResponse {
   tokensUsed?: number
   routedMode?: 'single' | 'debate'
   routedSubject?: 'humanities' | 'science' | 'unknown'
+  userMode?: 'single' | 'debate' | 'auto'
   routerModel?: string
   routerConfidence?: number
   routerTokensUsed?: number
@@ -48,6 +49,11 @@ export type ApiConfig = {
   apiKey: string
   baseUrl?: string
   model?: string
+}
+
+export const getAvailableModels = async (): Promise<string[]> => {
+  const response = await api.get<{ models: string[] }>('/models')
+  return Array.isArray(response.data?.models) ? response.data.models : []
 }
 
 export type StreamEvent =
@@ -162,10 +168,14 @@ export const solveQuestionStream = async (
   imageBlob: Blob,
   onEvent: (event: StreamEvent) => void,
   onUsage?: (usage: UsageInfo) => void,
-  apiConfig?: ApiConfig
+  apiConfig?: ApiConfig,
+  mode?: 'single' | 'debate' | 'auto'
 ): Promise<SolveQuestionResponse> => {
   const formData = new FormData()
   formData.append('image', imageBlob, 'question.jpg')
+  if (mode) {
+    formData.append('mode', mode)
+  }
 
   const endpoint = '/solve-auto-stream'
 
@@ -261,7 +271,8 @@ export const solveQuestionMultiStream = async (
   prompt: string | undefined,
   onEvent: (event: StreamEvent) => void,
   onUsage?: (usage: UsageInfo) => void,
-  apiConfig?: ApiConfig
+  apiConfig?: ApiConfig,
+  mode?: 'single' | 'debate' | 'auto'
 ): Promise<SolveQuestionResponse> => {
   const formData = new FormData()
   for (const [index, blob] of imageBlobs.entries()) {
@@ -269,6 +280,9 @@ export const solveQuestionMultiStream = async (
   }
   if (prompt) {
     formData.append('prompt', prompt)
+  }
+  if (mode) {
+    formData.append('mode', mode)
   }
 
   const endpoint = '/solve-multi-auto-stream'

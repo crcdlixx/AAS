@@ -10,6 +10,7 @@ dotenv.config()
 
 export type RouteSubject = 'humanities' | 'science' | 'unknown'
 export type RouteMode = 'single' | 'debate'
+export type UserMode = 'single' | 'debate' | 'auto'
 
 export type RouteDecision = {
   subject: RouteSubject
@@ -271,6 +272,53 @@ export async function routeQuestionFromImages(
 
   const subject = parsed.subject
   const mode = getSubjectMode(subject)
+
+  return {
+    subject,
+    mode,
+    confidence: parsed.confidence,
+    routerTokensUsed,
+    routerModel: modelName
+  }
+}
+
+export async function routeQuestionFromImagesWithModeOverride(
+  imagePaths: string[],
+  userMode: UserMode,
+  extraPrompt?: string,
+  apiOverride?: ApiOverride
+): Promise<RouteDecision> {
+  // If auto mode, use existing routing logic
+  if (userMode === 'auto') {
+    return routeQuestionFromImages(imagePaths, extraPrompt, apiOverride)
+  }
+
+  // For single or debate mode, still classify subject but override mode
+  const { model, modelName } = createRouterModel(apiOverride)
+  const images = encodeImages(imagePaths)
+
+  const content: any[] = []
+  content.push({
+    type: 'text',
+    text: extraPrompt ? `${ROUTER_PROMPT}\n\n补充说明：\n${extraPrompt}` : ROUTER_PROMPT
+  })
+  for (const image of images) {
+    content.push({
+      type: 'image_url',
+      image_url: { url: `data:${image.mimeType};base64,${image.base64Image}` }
+    })
+  }
+
+  const response = await model.invoke([new HumanMessage({ content })])
+  const text = toText((response as any)?.content)
+  const parsed = parseRouterJson(text)
+  const routerTokensUsed =
+    extractTotalTokens(response) ??
+    estimateTokensFromText(ROUTER_PROMPT + (extraPrompt ? `\n${extraPrompt}` : '') + text)
+
+  const subject = parsed.subject
+  // Override mode with user's selection
+  const mode = userMode as RouteMode
 
   return {
     subject,
