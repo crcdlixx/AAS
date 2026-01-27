@@ -7,6 +7,15 @@ dotenv.config()
 
 const MIN_NON_WHITESPACE_CHARS = 10
 
+const toPositiveInt = (value: unknown): number | null => {
+  const n = typeof value === 'string' ? Number.parseInt(value, 10) : typeof value === 'number' ? value : NaN
+  if (!Number.isFinite(n)) return null
+  const i = Math.floor(n)
+  return i > 0 ? i : null
+}
+
+const getPdfImageFallbackMaxPages = () => toPositiveInt(process.env.PDF_IMAGE_FALLBACK_MAX_PAGES) ?? 6
+
 async function extractTextFromPdf(filePath: string): Promise<string> {
   try {
     const dataBuffer = fs.readFileSync(filePath)
@@ -52,8 +61,15 @@ async function extractPdfViaImages(filePath: string): Promise<string> {
     })
 
     const pageTexts: string[] = []
+    const maxPages = getPdfImageFallbackMaxPages()
+    const totalPages = screenshots.pages.length
+    const pagesToProcess = Math.min(totalPages, maxPages)
 
-    for (let i = 0; i < screenshots.pages.length; i++) {
+    if (totalPages > pagesToProcess) {
+      console.warn(`[PDF] Image fallback page limit: ${pagesToProcess}/${totalPages} (PDF_IMAGE_FALLBACK_MAX_PAGES)`)
+    }
+
+    for (let i = 0; i < pagesToProcess; i++) {
       const page = screenshots.pages[i]
       const base64Image = Buffer.from(page.data).toString('base64')
 
@@ -74,7 +90,7 @@ async function extractPdfViaImages(filePath: string): Promise<string> {
 
       const text = typeof response.content === 'string' ? response.content : ''
       pageTexts.push(text.trim())
-      console.log(`[PDF] Extracted page ${i + 1}/${screenshots.pages.length}, length: ${text.length}`)
+      console.log(`[PDF] Extracted page ${i + 1}/${pagesToProcess}, length: ${text.length}`)
     }
 
     return pageTexts.join('\n\n')

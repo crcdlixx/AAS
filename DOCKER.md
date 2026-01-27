@@ -10,6 +10,7 @@
    - 复制 `.env.example` 为 `.env`
    - 修改 `DOCKERHUB_USERNAME` 为你的 Docker Hub 命名空间（Docker ID / 组织名，不能是邮箱）
    - 例：`mine1craft2`（而不是 `mine1craft2@126.com`）
+   - 若不设置 `DOCKERHUB_USERNAME`，`docker-compose.prod.yml` 默认回退为 `crcdlixx`
 
 ## 2) 本地构建 & 运行
 

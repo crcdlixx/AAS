@@ -60,7 +60,7 @@ export type StreamEvent =
   | { type: 'start' }
   | { type: 'delta'; value: string }
   | { type: 'complete'; value: string; result?: SolveQuestionResponse }
-  | { type: 'final'; result: SolveQuestionResponse }
+  | { type: 'final'; result: SolveQuestionResponse; usage?: UsageInfo }
   | { type: 'model1'; content: string; iteration?: number }
   | { type: 'model2'; content: string; iteration?: number }
   | { type: 'status'; message: string; iteration?: number }
@@ -129,12 +129,9 @@ export const solveQuestion = async (imageBlob: Blob): Promise<SolveQuestionRespo
   formData.append('image', imageBlob, 'question.jpg')
 
   const endpoint = '/solve-auto'
-  
-  const response = await api.post<SolveQuestionResponse>(endpoint, formData, {
-    headers: {
-      'Content-Type': 'multipart/form-data',
-    },
-  })
+
+  // Do NOT set `Content-Type` manually here; the browser/axios needs to inject the multipart boundary.
+  const response = await api.post<SolveQuestionResponse>(endpoint, formData)
 
   return response.data
 }
@@ -224,6 +221,7 @@ export const solveQuestionStream = async (
       }
       if (event.type === 'final' && event.result) {
         finalResult = event.result
+        if (event.usage) onUsage?.(event.usage)
       }
       if (event.type === 'error' && event.message) {
         throw new Error(event.message)
@@ -333,6 +331,7 @@ export const solveQuestionMultiStream = async (
       }
       if (event.type === 'final' && event.result) {
         finalResult = event.result
+        if (event.usage) onUsage?.(event.usage)
       }
       if (event.type === 'error' && event.message) {
         throw new Error(event.message)

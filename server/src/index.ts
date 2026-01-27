@@ -1,4 +1,4 @@
-import express, { type RequestHandler } from 'express'
+import express, { type ErrorRequestHandler, type RequestHandler } from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
 import multer from 'multer'
@@ -36,6 +36,7 @@ import {
 } from './services/debate.js'
 import {
   addFile,
+  assertCanAddFiles,
   removeFile,
   clearSession,
   getSessionFiles,
@@ -43,6 +44,8 @@ import {
   startCleanupTimer,
   type KnowledgeBaseFile
 } from './services/knowledgeBase.js'
+import { HttpError } from './services/httpError.js'
+import { validateImageFileMagic, validatePdfFileMagic, validateTextFileLooksText } from './services/uploadValidation.js'
 import { extractPdfContent } from './services/pdfProcessor.js'
 import { extractTxtContent } from './services/txtProcessor.js'
 
@@ -281,6 +284,11 @@ const attachRouting = (result: any, decision: RouteDecision, userMode?: UserMode
   }
 }
 
+const assertUploadOk = (result: { ok: boolean; reason?: string; code?: string }) => {
+  if (result.ok) return
+  throw new HttpError(400, result.reason || '上传文件校验失败', result.code || 'UPLOAD_INVALID')
+}
+
 // API路由 - 自动路由解答（单图）
 app.post('/api/solve-auto', usageGuard, upload.single('image'), async (req, res) => {
   try {
@@ -289,6 +297,7 @@ app.post('/api/solve-auto', usageGuard, upload.single('image'), async (req, res)
     }
 
     const imagePath = req.file.path
+    assertUploadOk(validateImageFileMagic(imagePath))
     const clientId = (req as any).clientId as string
     const apiOverride = getApiOverrideFromRequest(req)
     const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
@@ -327,6 +336,18 @@ app.post('/api/solve-auto', usageGuard, upload.single('image'), async (req, res)
     usageLimiter.setHeaders(res, snap)
     res.json(enriched)
   } catch (error) {
+    if (error instanceof HttpError) {
+      if (req.file) {
+        try {
+          fs.unlinkSync(req.file.path)
+        } catch (e) {
+          console.error('删除临时文件失败:', e)
+        }
+      }
+      res.status(error.statusCode).json({ error: error.message, code: error.code })
+      return
+    }
+
     console.error('自动路由解答失败:', error instanceof Error ? error.message : error)
 
     if (req.file) {
@@ -350,6 +371,10 @@ app.post('/api/solve-multi-auto', usageGuard, upload.array('images', 20), async 
   try {
     if (!files.length) {
       return res.status(400).json({ error: '请上传图片文件' })
+    }
+
+    for (const f of files) {
+      assertUploadOk(validateImageFileMagic(f.path))
     }
 
     const clientId = (req as any).clientId as string
@@ -393,6 +418,11 @@ app.post('/api/solve-multi-auto', usageGuard, upload.array('images', 20), async 
     usageLimiter.setHeaders(res, snap)
     res.json(enriched)
   } catch (error) {
+    if (error instanceof HttpError) {
+      cleanupUploadedFiles(files)
+      res.status(error.statusCode).json({ error: error.message, code: error.code })
+      return
+    }
     console.error('自动路由解答失败:', error instanceof Error ? error.message : error)
     cleanupUploadedFiles(files)
     res.status(500).json({
@@ -409,6 +439,17 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
   }
 
   const imagePath = req.file.path
+  try {
+    assertUploadOk(validateImageFileMagic(imagePath))
+  } catch (e) {
+    try {
+      fs.unlinkSync(imagePath)
+    } catch {}
+    if (e instanceof HttpError) {
+      return res.status(e.statusCode).json({ error: e.message, code: e.code })
+    }
+    return res.status(400).json({ error: '图片文件校验失败' })
+  }
   const clientId = (req as any).clientId as string
   const apiOverride = getApiOverrideFromRequest(req)
   const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
@@ -508,8 +549,19 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
         : result
 
     const enriched = attachRouting(enrichedResult, decision, userMode, kbInfo)
-    usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
-    send({ type: 'final', result: enriched })
+    const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
+    send({
+      type: 'final',
+      result: enriched,
+      usage: {
+        enabled: snap.enabled,
+        windowHours: snap.windowHours,
+        limitTokens: snap.limitTokens,
+        usedTokens: snap.usedTokens,
+        remainingTokens: snap.remainingTokens,
+        resetAtMs: snap.resetAtMs
+      }
+    })
     res.end()
   } catch (error) {
     send({ type: 'error', message: error instanceof Error ? error.message : '未知错误' })
@@ -528,6 +580,18 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
   const files = (req.files as Express.Multer.File[]) || []
   if (!files.length) {
     return res.status(400).json({ error: '请上传图片文件' })
+  }
+
+  try {
+    for (const f of files) {
+      assertUploadOk(validateImageFileMagic(f.path))
+    }
+  } catch (e) {
+    cleanupUploadedFiles(files)
+    if (e instanceof HttpError) {
+      return res.status(e.statusCode).json({ error: e.message, code: e.code })
+    }
+    return res.status(400).json({ error: '图片文件校验失败' })
   }
 
   const clientId = (req as any).clientId as string
@@ -634,8 +698,19 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
         : result
 
     const enriched = attachRouting(enrichedResult, decision, userMode, kbInfo)
-    usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
-    send({ type: 'final', result: enriched })
+    const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
+    send({
+      type: 'final',
+      result: enriched,
+      usage: {
+        enabled: snap.enabled,
+        windowHours: snap.windowHours,
+        limitTokens: snap.limitTokens,
+        usedTokens: snap.usedTokens,
+        remainingTokens: snap.remainingTokens,
+        resetAtMs: snap.resetAtMs
+      }
+    })
     res.end()
   } catch (error) {
     send({ type: 'error', message: error instanceof Error ? error.message : '未知错误' })
@@ -655,11 +730,21 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
       return res.status(400).json({ error: '请上传文件' })
     }
 
+    assertCanAddFiles(
+      clientId,
+      files.map((f) => ({ sizeBytes: f.size, originalName: f.originalname }))
+    )
+
     const processedFiles = []
 
     for (const file of files) {
       try {
         const fileType = path.extname(file.originalname).toLowerCase() === '.pdf' ? 'pdf' : 'txt'
+        if (fileType === 'pdf') {
+          assertUploadOk(validatePdfFileMagic(file.path))
+        } else {
+          assertUploadOk(validateTextFileLooksText(file.path))
+        }
         let content: string
         let extractionMethod: 'text' | 'image-fallback' = 'text'
 
@@ -702,7 +787,8 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
         console.error('[KB] File processing failed:', file.originalname, error)
         processedFiles.push({
           originalName: file.originalname,
-          error: error instanceof Error ? error.message : '处理失败'
+          error: error instanceof Error ? error.message : '处理失败',
+          ...(error instanceof HttpError ? { code: error.code } : {})
         } as any)
       } finally {
         // Clean up uploaded file
@@ -725,6 +811,10 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
       }
     })
   } catch (error) {
+    if (error instanceof HttpError) {
+      cleanupUploadedFiles(files)
+      return res.status(error.statusCode).json({ error: error.message, code: error.code })
+    }
     cleanupUploadedFiles(files)
     res.status(500).json({
       error: '文件上传失败',
@@ -827,6 +917,49 @@ app.get('/api/usage', (req, res) => {
   usageLimiter.setHeaders(res, snap)
   res.json(snap)
 })
+
+const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+  if (err instanceof UsageLimitError) {
+    usageLimiter.setHeaders(res, err.snapshot)
+    res.status(err.statusCode).json({
+      error: err.message,
+      enabled: err.snapshot.enabled,
+      limitTokens: err.snapshot.limitTokens,
+      usedTokens: err.snapshot.usedTokens,
+      remainingTokens: err.snapshot.remainingTokens,
+      resetAtMs: err.snapshot.resetAtMs
+    })
+    return
+  }
+
+  if (err instanceof HttpError) {
+    res.status(err.statusCode).json({ error: err.message, code: err.code })
+    return
+  }
+
+  const MulterErrorCtor = (multer as any)?.MulterError
+  const isMulterError = typeof MulterErrorCtor === 'function' && err instanceof MulterErrorCtor
+  if (isMulterError) {
+    const code = (err as any)?.code as string | undefined
+    const message =
+      code === 'LIMIT_FILE_SIZE'
+        ? '上传文件过大'
+        : code === 'LIMIT_FILE_COUNT'
+          ? '上传文件数量超限'
+          : code === 'LIMIT_UNEXPECTED_FILE'
+            ? '上传字段不符合预期'
+            : err instanceof Error
+              ? err.message
+              : '上传失败'
+    res.status(400).json({ error: message, code: code || 'UPLOAD_MULTER_ERROR' })
+    return
+  }
+
+  const message = err instanceof Error ? err.message : '未知错误'
+  res.status(500).json({ error: message })
+}
+
+app.use(errorHandler)
 
 // Start knowledge base cleanup timer
 startCleanupTimer()

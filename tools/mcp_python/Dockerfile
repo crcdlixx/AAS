@@ -3,7 +3,6 @@ FROM node:20-bookworm-slim AS build
 WORKDIR /app/tools/mcp_python
 
 COPY tools/mcp_python/package.json tools/mcp_python/package-lock.json ./
-COPY package.json package-lock.json /app/
 RUN npm ci
 
 COPY tools/mcp_python/tsconfig.json ./

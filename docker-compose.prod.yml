@@ -1,6 +1,6 @@
 services:
   mcp:
-    image: crcdlixx/aas-mcp:${IMAGE_TAG:-latest}
+    image: ${DOCKERHUB_USERNAME:-crcdlixx}/aas-mcp:${IMAGE_TAG:-latest}
     restart: unless-stopped
     environment:
       MCP_HTTP_HOST: 0.0.0.0
@@ -19,7 +19,7 @@ services:
       retries: 10
 
   api:
-    image: crcdlixx/aas-api:${IMAGE_TAG:-latest}
+    image: ${DOCKERHUB_USERNAME:-crcdlixx}/aas-api:${IMAGE_TAG:-latest}
     restart: unless-stopped
     env_file:
       - server/.env
@@ -43,7 +43,7 @@ services:
       retries: 10
 
   web:
-    image: crcdlixx/aas-web:${IMAGE_TAG:-latest}
+    image: ${DOCKERHUB_USERNAME:-crcdlixx}/aas-web:${IMAGE_TAG:-latest}
     restart: unless-stopped
     expose:
       - "80"
