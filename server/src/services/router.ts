@@ -328,3 +328,13 @@ export async function routeQuestionFromImagesWithModeOverride(
     routerModel: modelName
   }
 }
+
+export const buildRouteDecisionFromSubject = (subject: RouteSubject, userMode: UserMode): RouteDecision => {
+  const mode: RouteMode = userMode === 'auto' ? getSubjectMode(subject) : (userMode as RouteMode)
+  return {
+    subject,
+    mode,
+    routerTokensUsed: 0,
+    routerModel: 'manual'
+  }
+}

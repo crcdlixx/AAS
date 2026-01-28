@@ -21,7 +21,7 @@ copy .env.example .env
 
 #### 基础模型配置（必需）
 
-自动路由在需要“单模型回答”时，会使用这组默认 OpenAI 配置：
+当题目使用“单模型回答”时，会使用这组默认 OpenAI 配置：
 
 ```env
 PORT=5174
@@ -32,7 +32,7 @@ OPENAI_MODEL=gpt-4o
 
 #### 双模型审查配置（可选）
 
-自动路由在需要“双模型审查”时，会使用两套模型配置（模型1生成，模型2审查）：
+当题目使用“双模型审查”时，会使用两套模型配置（模型1生成，模型2审查）：
 
 **方案1：使用相同API密钥的不同模型**
 
@@ -73,12 +73,13 @@ MODEL2_BASE_URL=https://your-other-api-endpoint.com/v1
 MAX_DEBATE_ITERATIONS=3
 ```
 
-#### 自动路由配置（推荐）
+#### 分科/路由配置（推荐）
 
-自动路由会先用“路由模型”判断题目更偏文科还是理科，然后按学科配置选择“单模型回答”或“双模型审查”来回答。
+前端会按页选择题目分科（文科/理科），后端按学科配置选择“单模型回答”或“双模型审查”来回答。
+如果请求未提供分科（`subject`），后端才会使用“路由模型”自动判断文科/理科作为兜底。
 
 ```env
-# 路由模型（可选，留空则默认复用 OPENAI_API_KEY / OPENAI_BASE_URL）
+# 路由模型（可选兜底：仅在未提供 subject 时使用；留空则默认复用 OPENAI_API_KEY / OPENAI_BASE_URL）
 ROUTER_MODEL=gpt-4o-mini
 ROUTER_API_KEY=
 ROUTER_BASE_URL=
@@ -88,11 +89,11 @@ ROUTE_HUMANITIES_MODE=single
 ROUTE_SCIENCE_MODE=debate
 ROUTE_DEFAULT_MODE=debate
 
-# 自动路由下：单模型模型列表（逗号分隔，取第一个）
+# 分科/路由下：单模型模型列表（逗号分隔，取第一个）
 ROUTE_HUMANITIES_SINGLE_MODELS=gpt-4o-mini
 ROUTE_SCIENCE_SINGLE_MODELS=gpt-4o
 
-# 自动路由下：双模型审查模型列表（逗号分隔，对应模型1、模型2）
+# 分科/路由下：双模型审查模型列表（逗号分隔，对应模型1、模型2）
 ROUTE_HUMANITIES_DEBATE_MODELS=gpt-4o-mini,gpt-4o
 ROUTE_SCIENCE_DEBATE_MODELS=gpt-4o-mini,gpt-4o
 
@@ -135,13 +136,13 @@ npm run dev
 - 调整选框大小以精确框选题目
 - 裁剪会自动保存
 
-### 3. 自动路由解答
+### 3. 分科解答（按页）
 
-- 先判断文科/理科
-- 再按学科配置选择“单模型回答”或“双模型审查”
-- 适合不确定题型或批量处理
+- 先为当前页面选择分科（文科/理科）
+- 再按每道题选择解题模式（自动/单模型/双模型）
+- 点击“开始解答（按每题模式）”
 
-你也可以在界面里手动选择模式：
+每道题都可以在界面里单独选择模式：
 
 - `auto`：按路由结果决定单模型/双模型
 - `single`：强制单模型
@@ -153,7 +154,7 @@ npm run dev
 - 识别出的题目内容
 - 详细的解答步骤
 
-当自动路由选择“双模型审查”时，还会显示：
+当选择“双模型审查”时，还会显示：
 - 迭代次数
 - 是否达成共识
 
@@ -177,7 +178,7 @@ A: 可以！只要模型API兼容OpenAI格式，就可以配置使用。例如�
 
 ### Q: 为什么界面没有“单模型/多模型”切换？
 
-A: 目前界面已支持模式切换（`auto/single/debate`）。如果选择 `auto`，仍会按路由结果自动决定单模型或双模型审查。
+A: 现在是“每道题单独选择模式”（`auto/single/debate`），并且需要先按页选择分科（文科/理科）。如果选择 `auto`，仍会按学科策略自动决定单模型或双模型审查。
 
 ## 技术支持
 

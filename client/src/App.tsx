@@ -44,6 +44,7 @@ type ImageItem = {
   name: string
   url: string
   defaultMode: ModelMode
+  subject: 'science' | 'humanities' | 'unknown'
   crops: CropBox[]
   groups: CropGroups
   activeCropId: string
@@ -89,7 +90,6 @@ function App() {
   const [tasks, setTasks] = useState<SolveTask[]>([])
   const [taskDrawerOpen, setTaskDrawerOpen] = useState(false)
   const [exportingMd, setExportingMd] = useState(false)
-  const [globalMode, setGlobalMode] = useState<ModelMode>('auto')
   const [usageInfo, setUsageInfo] = useState<UsageInfo | null>(null)
   const [apiConfigOpen, setApiConfigOpen] = useState(false)
   const [apiConfigEnabled, setApiConfigEnabled] = useState(false)
@@ -199,13 +199,14 @@ function App() {
       file,
       name: file.name,
       url,
-      defaultMode: globalMode,
+      defaultMode: 'auto',
+      subject: 'unknown',
       crops: [
         {
           id: firstCropId,
           title: '题目 1',
           crop: { unit: '%', width: 50, height: 50, x: 25, y: 25 },
-          mode: globalMode
+          mode: 'auto'
         }
       ],
       groups: {},
@@ -311,7 +312,7 @@ function App() {
     message.success('已清除自定义跨图合并规则')
   }
 
-  const runTask = async (task: SolveTask, blobs: Blob[], prompt: string) => {
+  const runTask = async (task: SolveTask, blobs: Blob[], prompt: string, subject: ImageItem['subject']) => {
     setTaskDrawerOpen(true)
 
     const sanitize = (text: string) => text.replace(/<\/?think>/g, '')
@@ -354,7 +355,8 @@ function App() {
         },
         (u) => setUsageInfo(u),
         activeApiConfig,
-        task.mode
+        task.mode,
+        subject
       )
 
       setTasks((prev) =>
@@ -516,6 +518,10 @@ function App() {
 
   const solveActiveImage = async () => {
     if (!activeImage) return
+    if (activeImage.subject === 'unknown') {
+      message.warning('请先在当前页面选择文科/理科分科')
+      return
+    }
     if (apiConfigEnabled && !apiKey.trim()) {
       message.error('已开启自定义 API，但未填写 API Key')
       return
@@ -555,6 +561,14 @@ function App() {
       const toCrop = activeImage.crops.find((c) => c.id === override?.toCropId) || fallbackTo
 
       if (fromCrop && toCrop) {
+        if (prevImage.subject === 'unknown') {
+          message.warning('检测到跨图合并，但上一页未选择文科/理科分科')
+          return
+        }
+        if (prevImage.subject !== activeImage.subject) {
+          message.error('跨图合并的两页分科不一致，请先把两页都选成同一种（文科/理科）')
+          return
+        }
         const key = groupKey(toCrop)
         addToGroup(key, {
           image: prevImage,
@@ -673,7 +687,7 @@ function App() {
         groupCrops.map((x) => ({ label: x.label, title: x.crop.title }))
       )
       setTasks((prev) => [task, ...prev])
-      runTask(task, blobs, prompt)
+      runTask(task, blobs, prompt, activeImage.subject)
     }
   }
 
@@ -787,12 +801,7 @@ function App() {
               activeKey={activeImageId}
               onChange={setActiveImageId}
               items={images.map((img) => {
-                const actionLabel =
-                  globalMode === 'single'
-                    ? '单模型解答'
-                    : globalMode === 'debate'
-                      ? '双模型审查解答'
-                      : '自动路由解答'
+                const actionLabel = '开始解答（按每题模式）'
 
                 return {
                   key: img.id,
@@ -800,26 +809,25 @@ function App() {
                   children: (
                     <div className="workspace">
                       <div className="workspace-toolbar">
-                        <Space direction="vertical" size="small" style={{ width: '100%' }}>
-                          <div>
-                            <span style={{ marginRight: 8, fontWeight: 500 }}>全局解题模式：</span>
-                            <Select
-                              value={globalMode}
-                              onChange={setGlobalMode}
-                              style={{ width: 200 }}
-                              options={[
-                                { value: 'auto', label: '🔄 自动路由（推荐）' },
-                                { value: 'single', label: '⚡ 单模型' },
-                                { value: 'debate', label: '🔍 双模型审查' }
-                              ]}
-                            />
-                          </div>
-                          <div className="mode-hint" style={{ fontSize: 12, color: '#666' }}>
-                            {globalMode === 'auto' && '先判断文科/理科，再选择合适的模型组合'}
-                            {globalMode === 'single' && '使用单个模型快速解答'}
-                            {globalMode === 'debate' && '使用两个模型互相审查，提高准确性'}
-                          </div>
-                        </Space>
+                        <div className="mode-hint" style={{ fontSize: 12, color: '#666' }}>
+                          每道题的解题模式请在题目列表中单独选择（自动/单模型/双模型）。
+                        </div>
+
+                        <div>
+                          <span style={{ marginRight: 8, fontWeight: 500 }}>本页分科：</span>
+                          <Select
+                            value={img.subject}
+                            onChange={(subject) =>
+                              updateImage(img.id, (prev) => ({ ...prev, subject: subject as ImageItem['subject'] }))
+                            }
+                            style={{ width: 220 }}
+                            options={[
+                              { value: 'unknown', label: '请选择（文科/理科）' },
+                              { value: 'humanities', label: '文科' },
+                              { value: 'science', label: '理科' }
+                            ]}
+                          />
+                        </div>
 
                         <Space wrap>
                           <Button icon={<LinkOutlined />} onClick={openCrossImageMergeModal} disabled={!activeImage}>

@@ -17,6 +17,7 @@ import {
 } from './services/openai.js'
 import {
   applyModelOverride,
+  buildRouteDecisionFromSubject,
   getSubjectDebateModelsOverride,
   getSubjectSingleModelOverride,
   routeQuestionFromImages,
@@ -263,6 +264,12 @@ const createId = () =>
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`
 
+const parseUserSubject = (raw: unknown): RouteSubject | undefined => {
+  const v = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
+  if (v === 'science' || v === 'humanities' || v === 'unknown') return v as RouteSubject
+  return undefined
+}
+
 const attachRouting = (result: any, decision: RouteDecision, userMode?: UserMode, kbInfo?: any) => {
   const baseTokens = typeof result?.tokensUsed === 'number' ? result.tokensUsed : 0
   return {
@@ -307,7 +314,10 @@ app.post('/api/solve-auto', usageGuard, upload.single('image'), async (req, res)
       ? (req.body.mode as UserMode)
       : 'auto'
 
-    const decision = await routeQuestionFromImagesWithModeOverride([imagePath], userMode, undefined, apiOverride)
+    const userSubject = parseUserSubject(req.body?.subject)
+    const decision = userSubject
+      ? buildRouteDecisionFromSubject(userSubject, userMode)
+      : await routeQuestionFromImagesWithModeOverride([imagePath], userMode, undefined, apiOverride)
     const answerOverride = applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
     const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
@@ -388,7 +398,10 @@ app.post('/api/solve-multi-auto', usageGuard, upload.array('images', 20), async 
       ? (req.body.mode as UserMode)
       : 'auto'
 
-    const decision = await routeQuestionFromImagesWithModeOverride(imagePaths, userMode, promptRaw, apiOverride)
+    const userSubject = parseUserSubject(req.body?.subject)
+    const decision = userSubject
+      ? buildRouteDecisionFromSubject(userSubject, userMode)
+      : await routeQuestionFromImagesWithModeOverride(imagePaths, userMode, promptRaw, apiOverride)
     const answerOverride = applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
     const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
@@ -473,8 +486,12 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
   }
 
   try {
-    const decision = await routeQuestionFromImagesWithModeOverride([imagePath], userMode, undefined, apiOverride)
-    const routeMessage = `路由结果：${subjectLabel(decision.subject)} → ${modeLabel(decision.mode)}${
+    const userSubject = parseUserSubject(req.body?.subject)
+    const decision = userSubject
+      ? buildRouteDecisionFromSubject(userSubject, userMode)
+      : await routeQuestionFromImagesWithModeOverride([imagePath], userMode, undefined, apiOverride)
+    const routePrefix = decision.routerModel === 'manual' ? '用户选择' : '路由结果'
+    const routeMessage = `${routePrefix}：${subjectLabel(decision.subject)} → ${modeLabel(decision.mode)}${
       typeof decision.confidence === 'number' ? `（置信度 ${decision.confidence.toFixed(2)}）` : ''
     }`
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
@@ -619,8 +636,12 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
   }
 
   try {
-    const decision = await routeQuestionFromImagesWithModeOverride(imagePaths, userMode, promptRaw, apiOverride)
-    const routeMessage = `路由结果：${subjectLabel(decision.subject)} → ${modeLabel(decision.mode)}${
+    const userSubject = parseUserSubject(req.body?.subject)
+    const decision = userSubject
+      ? buildRouteDecisionFromSubject(userSubject, userMode)
+      : await routeQuestionFromImagesWithModeOverride(imagePaths, userMode, promptRaw, apiOverride)
+    const routePrefix = decision.routerModel === 'manual' ? '用户选择' : '路由结果'
+    const routeMessage = `${routePrefix}：${subjectLabel(decision.subject)} → ${modeLabel(decision.mode)}${
       typeof decision.confidence === 'number' ? `（置信度 ${decision.confidence.toFixed(2)}）` : ''
     }`
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)

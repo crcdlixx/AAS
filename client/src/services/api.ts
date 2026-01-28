@@ -270,7 +270,8 @@ export const solveQuestionMultiStream = async (
   onEvent: (event: StreamEvent) => void,
   onUsage?: (usage: UsageInfo) => void,
   apiConfig?: ApiConfig,
-  mode?: 'single' | 'debate' | 'auto'
+  mode?: 'single' | 'debate' | 'auto',
+  subject?: 'science' | 'humanities' | 'unknown'
 ): Promise<SolveQuestionResponse> => {
   const formData = new FormData()
   for (const [index, blob] of imageBlobs.entries()) {
@@ -281,6 +282,9 @@ export const solveQuestionMultiStream = async (
   }
   if (mode) {
     formData.append('mode', mode)
+  }
+  if (subject) {
+    formData.append('subject', subject)
   }
 
   const endpoint = '/solve-multi-auto-stream'
