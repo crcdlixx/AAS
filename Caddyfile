@@ -1,4 +1,11 @@
 {$DOMAIN} {
   encode gzip zstd
+
+  # Fix Vite `base: ./` assets when the site is accessed under a sub-path.
+  # Example: /foo loads ./assets/... => browser requests /foo/assets/...
+  # Nginx SPA fallback would otherwise return index.html (text/html) for JS/CSS.
+  @subpathAssets path_regexp subpathAssets ^/.+/assets/(.*)$
+  rewrite @subpathAssets /assets/{re.subpathAssets.1}
+
   reverse_proxy web:80
 }
