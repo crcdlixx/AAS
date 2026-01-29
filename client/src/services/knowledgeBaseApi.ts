@@ -1,8 +1,11 @@
 import axios from 'axios'
 import { getFingerprintId } from '../utils/fingerprint'
 
+const API_BASE = import.meta.env.VITE_API_BASE || '/api'
+const KB_BASE = import.meta.env.VITE_KB_API_BASE || `${API_BASE}/knowledge-base`
+
 const api = axios.create({
-  baseURL: '/api/knowledge-base',
+  baseURL: KB_BASE,
   timeout: 120000
 })
 

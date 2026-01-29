@@ -1,8 +1,10 @@
 import axios from 'axios'
 import { getFingerprintId } from '../utils/fingerprint'
 
+const API_BASE = import.meta.env.VITE_API_BASE || '/api'
+
 const api = axios.create({
-  baseURL: '/api',
+  baseURL: API_BASE,
   timeout: 120000, // 增加超时时间以支持多模型博弈
 })
 
@@ -117,7 +119,7 @@ export const getUsageInfoFromHeaders = (headers: Headers): UsageInfo | null => {
 
 export const getUsage = async (): Promise<UsageInfo> => {
   const fingerprint = await getFingerprintId()
-  const response = await fetch('/api/usage', { headers: { 'X-AAS-Fingerprint': fingerprint } })
+  const response = await fetch(`${API_BASE}/usage`, { headers: { 'X-AAS-Fingerprint': fingerprint } })
   if (!response.ok) {
     throw new Error(await parseResponseErrorMessage(response))
   }
@@ -177,7 +179,7 @@ export const solveQuestionStream = async (
   const endpoint = '/solve-auto-stream'
 
   const fingerprint = await getFingerprintId()
-  const response = await fetch(`/api${endpoint}`, {
+  const response = await fetch(`${API_BASE}${endpoint}`, {
     method: 'POST',
     body: formData,
     headers: { 'X-AAS-Fingerprint': fingerprint, ...buildApiOverrideHeaders(apiConfig) }
@@ -290,7 +292,7 @@ export const solveQuestionMultiStream = async (
   const endpoint = '/solve-multi-auto-stream'
 
   const fingerprint = await getFingerprintId()
-  const response = await fetch(`/api${endpoint}`, {
+  const response = await fetch(`${API_BASE}${endpoint}`, {
     method: 'POST',
     body: formData,
     headers: { 'X-AAS-Fingerprint': fingerprint, ...buildApiOverrideHeaders(apiConfig) }

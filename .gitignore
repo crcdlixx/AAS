@@ -7,6 +7,10 @@ server/node_modules/
 dist/
 client/dist/
 server/dist/
+apps/desktop/renderer/
+apps/mobile/www/
+apps/mobile/android/app/src/main/assets/public/
+apps/mobile/ios/App/App/public/
 
 # Environment variables
 .env
