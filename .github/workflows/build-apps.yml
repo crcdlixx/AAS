@@ -44,6 +44,12 @@ jobs:
         working-directory: apps/desktop
         run: npm ci
 
+      - name: Install Linux packaging deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64
+
       - name: Build desktop installers
         working-directory: apps/desktop
         run: npm run dist

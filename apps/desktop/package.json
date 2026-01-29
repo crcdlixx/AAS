@@ -4,6 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "main": "src/main.mjs",
+  "author": {
+    "name": "AAS",
+    "email": "dev@example.com"
+  },
   "scripts": {
     "build:web": "npm --prefix ../../client run build",
     "sync:web": "node scripts/sync-web.mjs",
@@ -42,6 +46,7 @@
       ]
     },
     "linux": {
+      "maintainer": "AAS <dev@example.com>",
       "target": [
         "AppImage",
         "deb"
