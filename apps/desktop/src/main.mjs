@@ -33,7 +33,10 @@ const createLocalServer = async ({ apiTarget }) => {
     createProxyMiddleware({
       target: apiTarget,
       changeOrigin: true,
-      ws: true
+      ws: true,
+      // Express strips the mount path ('/api') from req.url before it reaches the proxy middleware.
+      // Our backend routes are prefixed with '/api', so we need to add it back.
+      pathRewrite: (path) => (path.startsWith('/api') ? path : `/api${path}`)
     })
   )
   server.use(express.static(rendererDir))

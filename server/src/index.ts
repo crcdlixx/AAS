@@ -1022,7 +1022,8 @@ export const startServer = async (opts?: { port?: number | string }) => {
 
   startPromise = new Promise((resolve, reject) => {
     try {
-      startCleanupTimer()
+      const timer = startCleanupTimer()
+      ;(timer as any)?.unref?.()
     } catch {
       // ignore
     }
