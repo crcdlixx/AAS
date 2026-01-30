@@ -8,6 +8,7 @@ dist/
 client/dist/
 server/dist/
 apps/desktop/renderer/
+apps/desktop/server/
 apps/mobile/www/
 apps/mobile/android/app/src/main/assets/public/
 apps/mobile/ios/App/App/public/

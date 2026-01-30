@@ -12,17 +12,29 @@
   },
   "scripts": {
     "build:web": "npm --prefix ../../client run build",
+    "build:server": "npm --prefix ../../server run build",
     "sync:web": "node scripts/sync-web.mjs",
-    "dist": "npm run build:web && npm run sync:web && electron-builder --publish never"
+    "sync:server": "node scripts/sync-server.mjs",
+    "dist": "npm run build:web && npm run build:server && npm run sync:web && npm run sync:server && electron-builder --publish never"
   },
   "devDependencies": {
     "electron": "^30.0.0",
     "electron-builder": "^24.13.3"
   },
   "dependencies": {
+    "@langchain/core": "^0.1.63",
+    "@langchain/langgraph": "^0.0.19",
+    "@langchain/openai": "^0.0.14",
     "ai-question-solver": "file:../..",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "http-proxy-middleware": "^3.0.0"
+    "http-proxy-middleware": "^3.0.0",
+    "iconv-lite": "^0.7.2",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^4.20.0",
+    "pdf-parse": "^2.4.5",
+    "pdf-to-png-converter": "^3.11.0"
   },
   "build": {
     "appId": "com.aas.desktop",
@@ -30,6 +42,7 @@
     "files": [
       "src/**",
       "renderer/**",
+      "server/**",
       "package.json"
     ],
     "directories": {

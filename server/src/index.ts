@@ -56,7 +56,38 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const app = express()
-const PORT = process.env.PORT || 5174
+
+const resolveDataDir = (): string => {
+  const explicit = typeof process.env.AAS_DATA_DIR === 'string' ? process.env.AAS_DATA_DIR.trim() : ''
+  if (explicit) return path.resolve(explicit)
+  return path.join(__dirname, '..')
+}
+
+const resolveUploadsDir = (): string => {
+  const explicit = typeof process.env.UPLOADS_DIR === 'string' ? process.env.UPLOADS_DIR.trim() : ''
+  if (explicit) return path.resolve(explicit)
+  return path.join(resolveDataDir(), 'uploads')
+}
+
+const resolveUsageStorePath = (): string => {
+  const explicit = typeof process.env.USAGE_STORE_PATH === 'string' ? process.env.USAGE_STORE_PATH.trim() : ''
+  if (explicit) return path.resolve(explicit)
+  return path.join(resolveDataDir(), 'usage-store.json')
+}
+
+const normalizePort = (value: unknown, fallback: number): number => {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, Math.floor(value))
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return fallback
+    const n = Number.parseInt(trimmed, 10)
+    if (Number.isFinite(n)) return Math.max(0, n)
+  }
+  return fallback
+}
+
+// Legacy constant kept to avoid TypeScript errors in unreachable compatibility code paths.
+const PORT = normalizePort(process.env.PORT, 5174)
 
 const parseTrustProxy = (value: string): boolean | number | string => {
   const v = value.trim()
@@ -131,7 +162,7 @@ const getAvailableModelsFromEnv = (): string[] => {
 const usageLimiter = createUsageLimiter({
   limitTokens: process.env.USAGE_LIMIT_TOKENS,
   windowHours: process.env.USAGE_LIMIT_WINDOW_HOURS,
-  storePath: path.join(__dirname, '../usage-store.json')
+  storePath: resolveUsageStorePath()
 })
 
 const usageGuard: RequestHandler = (req, res, next) => {
@@ -181,7 +212,7 @@ app.get('/api/models', (_req, res) => {
 })
 
 // 创建上传目录
-const uploadsDir = path.join(__dirname, '../uploads')
+const uploadsDir = resolveUploadsDir()
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true })
 }
@@ -982,10 +1013,54 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
 
 app.use(errorHandler)
 
-// Start knowledge base cleanup timer
-startCleanupTimer()
+let startPromise: Promise<{ port: number; server: any }> | null = null
 
-app.listen(PORT, () => {
+export const startServer = async (opts?: { port?: number | string }) => {
+  if (startPromise) return startPromise
+
+  const requestedPort = normalizePort(opts?.port ?? process.env.PORT, 5174)
+
+  startPromise = new Promise((resolve, reject) => {
+    try {
+      startCleanupTimer()
+    } catch {
+      // ignore
+    }
+
+    const server = app.listen(requestedPort, () => {
+      const address = server.address()
+      const port =
+        typeof address === 'object' && address && typeof (address as any).port === 'number'
+          ? (address as any).port
+          : requestedPort
+
+      console.log(`馃殌 鏈嶅姟鍣ㄨ繍琛屽湪 http://localhost:${port}`)
+      console.log(`馃摑 API绔偣: http://localhost:${port}/api`)
+
+      if (process.env.AAS_PRINT_PORT === '1') {
+        console.log(`AAS_PORT=${port}`)
+      }
+
+      resolve({ port, server })
+    })
+
+    server.on('error', (err) => {
+      reject(err)
+    })
+  })
+
+  return startPromise
+}
+
+if (process.env.AAS_EMBEDDED !== '1') {
+  startServer().catch((error) => {
+    console.error('server start failed:', error instanceof Error ? error.message : error)
+    process.exitCode = 1
+  })
+}
+
+// Legacy autostart block removed
+if (false) app.listen(0, () => {
   console.log(`🚀 服务器运行在 http://localhost:${PORT}`)
   console.log(`📝 API端点: http://localhost:${PORT}/api`)
 })

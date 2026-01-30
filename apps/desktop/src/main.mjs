@@ -1,5 +1,6 @@
 import { app, BrowserWindow } from 'electron'
 import express from 'express'
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createProxyMiddleware } from 'http-proxy-middleware'
@@ -7,8 +8,23 @@ import { createProxyMiddleware } from 'http-proxy-middleware'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-const createLocalServer = async () => {
-  const apiTarget = process.env.AAS_API_TARGET || 'http://127.0.0.1:5174'
+const startEmbeddedApiServer = async () => {
+  const dataDir = path.join(app.getPath('userData'), 'aas-server')
+  const uploadsDir = path.join(dataDir, 'uploads')
+
+  fs.mkdirSync(uploadsDir, { recursive: true })
+
+  process.env.AAS_EMBEDDED = '1'
+  process.env.AAS_DATA_DIR = dataDir
+  process.env.UPLOADS_DIR = uploadsDir
+  process.env.USAGE_STORE_PATH = path.join(dataDir, 'usage-store.json')
+
+  const { startServer } = await import('../server/index.js')
+  const { port, server } = await startServer({ port: 0 })
+  return { port, server }
+}
+
+const createLocalServer = async ({ apiTarget }) => {
   const rendererDir = path.join(__dirname, '..', 'renderer')
 
   const server = express()
@@ -44,7 +60,17 @@ const createWindow = async (url) => {
 }
 
 app.whenReady().then(async () => {
-  const httpServer = await createLocalServer()
+  let embedded = null
+  try {
+    embedded = await startEmbeddedApiServer()
+  } catch (e) {
+    console.error('[desktop] failed to start embedded API server, falling back:', e instanceof Error ? e.message : e)
+  }
+
+  const apiTarget =
+    embedded && embedded.port ? `http://127.0.0.1:${embedded.port}` : process.env.AAS_API_TARGET || 'http://127.0.0.1:5174'
+
+  const httpServer = await createLocalServer({ apiTarget })
   const address = httpServer.address()
   const port = typeof address === 'object' && address ? address.port : null
   if (!port) throw new Error('Failed to start local server')
@@ -54,6 +80,12 @@ app.whenReady().then(async () => {
   app.on('before-quit', () => {
     try {
       httpServer.close()
+    } catch {
+      // ignore
+    }
+
+    try {
+      embedded?.server?.close?.()
     } catch {
       // ignore
     }
@@ -69,4 +101,3 @@ app.on('activate', () => {
     createWindow('about:blank')
   }
 })
-
