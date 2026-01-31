@@ -19,6 +19,7 @@ api.interceptors.request.use(async (config) => {
 export type KnowledgeBaseFile = {
   id: string
   originalName: string
+  description: string
   type: 'pdf' | 'txt'
   extractionMethod: 'text' | 'image-fallback'
   sizeBytes: number
@@ -34,11 +35,12 @@ export type UploadResponse = {
   }
 }
 
-export const uploadFiles = async (files: File[]): Promise<UploadResponse> => {
+export const uploadFiles = async (files: File[], descriptions: string[]): Promise<UploadResponse> => {
   const formData = new FormData()
   for (const file of files) {
     formData.append('files', file)
   }
+  formData.append('descriptions', JSON.stringify(descriptions))
 
   const response = await api.post<UploadResponse>('/upload', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }

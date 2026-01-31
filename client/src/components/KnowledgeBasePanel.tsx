@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Upload, Button, List, Tag, Space, message, Collapse } from 'antd'
+import { Upload, Button, List, Tag, Space, message, Collapse, Input } from 'antd'
 import { UploadOutlined, DeleteOutlined, FileTextOutlined, FilePdfOutlined } from '@ant-design/icons'
 import type { UploadFile } from 'antd'
 import { uploadFiles, listFiles, removeFile, clearAll, type KnowledgeBaseFile } from '../services/knowledgeBaseApi'
@@ -12,6 +12,7 @@ type Props = {
 export default function KnowledgeBasePanel({ files, onFilesChange }: Props) {
   const [uploading, setUploading] = useState(false)
   const [fileList, setFileList] = useState<UploadFile[]>([])
+  const [fileDescriptions, setFileDescriptions] = useState<Record<string, string>>({})
 
   const handleUpload = async () => {
     if (!fileList.length) {
@@ -22,7 +23,13 @@ export default function KnowledgeBasePanel({ files, onFilesChange }: Props) {
     setUploading(true)
     try {
       const filesToUpload = fileList.map((f) => f.originFileObj as File)
-      const response = await uploadFiles(filesToUpload)
+      const descriptions = fileList.map((f) => (fileDescriptions[f.uid] || '').trim())
+      if (descriptions.some((d) => !d)) {
+        message.warning('请为每个文件填写描述')
+        return
+      }
+
+      const response = await uploadFiles(filesToUpload, descriptions)
 
       const successCount = response.files.filter((f) => !f.error).length
       const errorCount = response.files.filter((f) => f.error).length
@@ -38,6 +45,7 @@ export default function KnowledgeBasePanel({ files, onFilesChange }: Props) {
       const updated = await listFiles()
       onFilesChange(updated.files)
       setFileList([])
+      setFileDescriptions({})
     } catch (error) {
       message.error(error instanceof Error ? error.message : '上传失败')
     } finally {
@@ -88,16 +96,52 @@ export default function KnowledgeBasePanel({ files, onFilesChange }: Props) {
               <div>
                 <Upload
                   fileList={fileList}
-                  onChange={({ fileList }) => setFileList(fileList)}
+                  onChange={({ fileList: next }) => {
+                    setFileList(next)
+                    setFileDescriptions((prev) => {
+                      const out: Record<string, string> = {}
+                      for (const f of next) out[f.uid] = prev[f.uid] || ''
+                      return out
+                    })
+                  }}
                   beforeUpload={() => false}
                   accept=".pdf,.txt"
                   multiple
                 >
                   <Button icon={<UploadOutlined />}>选择文件 (PDF/TXT)</Button>
                 </Upload>
+                {fileList.length > 0 && (
+                  <List
+                    size="small"
+                    bordered
+                    style={{ marginTop: 8 }}
+                    dataSource={fileList}
+                    renderItem={(f) => (
+                      <List.Item>
+                        <Space direction="vertical" style={{ width: '100%' }} size="small">
+                          <div style={{ fontWeight: 500 }}>{f.name}</div>
+                          <Input.TextArea
+                            rows={2}
+                            value={fileDescriptions[f.uid] || ''}
+                            onChange={(e) => {
+                              const value = e.target.value
+                              setFileDescriptions((prev) => ({ ...prev, [f.uid]: value }))
+                            }}
+                            placeholder="文件描述（必填）：这份资料主要包含什么、适用于哪些题目/场景"
+                          />
+                        </Space>
+                      </List.Item>
+                    )}
+                  />
+                )}
                 <div style={{ marginTop: 8 }}>
                   <Space>
-                    <Button type="primary" onClick={handleUpload} loading={uploading} disabled={!fileList.length}>
+                    <Button
+                      type="primary"
+                      onClick={handleUpload}
+                      loading={uploading}
+                      disabled={!fileList.length || fileList.some((f) => !(fileDescriptions[f.uid] || '').trim())}
+                    >
                       上传
                     </Button>
                     {files.length > 0 && (
@@ -133,13 +177,18 @@ export default function KnowledgeBasePanel({ files, onFilesChange }: Props) {
                         avatar={file.type === 'pdf' ? <FilePdfOutlined /> : <FileTextOutlined />}
                         title={file.originalName}
                         description={
-                          <Space size="small">
+                          <div>
+                            <Space size="small">
                             <Tag color={file.type === 'pdf' ? 'red' : 'blue'}>{file.type.toUpperCase()}</Tag>
                             <Tag color={file.extractionMethod === 'text' ? 'green' : 'orange'}>
                               {file.extractionMethod === 'text' ? '文本提取' : '图像回退'}
                             </Tag>
                             <span style={{ color: 'rgba(0,0,0,0.45)' }}>{formatFileSize(file.sizeBytes)}</span>
-                          </Space>
+                            </Space>
+                            {file.description && (
+                              <div style={{ marginTop: 4, color: 'rgba(0,0,0,0.65)' }}>{file.description}</div>
+                            )}
+                          </div>
                         }
                       />
                     </List.Item>

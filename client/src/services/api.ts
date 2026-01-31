@@ -50,11 +50,15 @@ export type UsageInfo = {
 export type ApiConfig = {
   apiKey: string
   baseUrl?: string
-  model?: string
+  singleModel?: string
+  debateModel1?: string
+  debateModel2?: string
+  routerModel?: string
+  modelCandidates?: string[]
 }
 
-export const getAvailableModels = async (): Promise<string[]> => {
-  const response = await api.get<{ models: string[] }>('/models')
+export const getAvailableModels = async (apiConfig?: ApiConfig): Promise<string[]> => {
+  const response = await api.get<{ models: string[] }>('/models', { headers: buildApiOverrideHeaders(apiConfig) })
   return Array.isArray(response.data?.models) ? response.data.models : []
 }
 
@@ -138,11 +142,52 @@ export const solveQuestion = async (imageBlob: Blob): Promise<SolveQuestionRespo
   return response.data
 }
 
-const buildApiOverrideHeaders = (apiConfig?: ApiConfig) => {
+const uniqueModels = (models: string[] | undefined) => {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const m of models || []) {
+    const v = (m || '').trim()
+    if (!v) continue
+    if (seen.has(v)) continue
+    seen.add(v)
+    out.push(v)
+  }
+  return out
+}
+
+const pickRandomModel = (models: string[] | undefined) => {
+  const list = uniqueModels(models)
+  if (!list.length) return undefined
+  const idx = Math.floor(Math.random() * list.length)
+  return list[idx]
+}
+
+const pickRandomModelExcluding = (models: string[] | undefined, exclude: string | undefined) => {
+  const ex = (exclude || '').trim()
+  const list = uniqueModels(models).filter((m) => (ex ? m !== ex : true))
+  if (!list.length) return undefined
+  const idx = Math.floor(Math.random() * list.length)
+  return list[idx]
+}
+
+const clean = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
+
+function buildApiOverrideHeaders(apiConfig?: ApiConfig) {
   if (!apiConfig?.apiKey) return {}
   const headers: Record<string, string> = { 'X-AAS-Api-Key': apiConfig.apiKey }
   if (apiConfig.baseUrl) headers['X-AAS-Base-Url'] = apiConfig.baseUrl
-  if (apiConfig.model) headers['X-AAS-Model'] = apiConfig.model
+
+  const candidates = apiConfig.modelCandidates
+  const singleModel = clean(apiConfig.singleModel) || pickRandomModel(candidates) || ''
+  const debateModel1 = clean(apiConfig.debateModel1) || pickRandomModel(candidates) || ''
+  const debateModel2 = clean(apiConfig.debateModel2) || pickRandomModelExcluding(candidates, debateModel1) || ''
+  const routerModel = clean(apiConfig.routerModel) || pickRandomModel(candidates) || ''
+
+  if (singleModel) headers['X-AAS-Model-Single'] = singleModel
+  if (debateModel1) headers['X-AAS-Model-Debate-1'] = debateModel1
+  if (debateModel2) headers['X-AAS-Model-Debate-2'] = debateModel2
+  if (routerModel) headers['X-AAS-Model-Router'] = routerModel
+
   return headers
 }
 
@@ -168,7 +213,8 @@ export const solveQuestionStream = async (
   onEvent: (event: StreamEvent) => void,
   onUsage?: (usage: UsageInfo) => void,
   apiConfig?: ApiConfig,
-  mode?: 'single' | 'debate' | 'auto'
+  mode?: 'single' | 'debate' | 'auto',
+  signal?: AbortSignal
 ): Promise<SolveQuestionResponse> => {
   const formData = new FormData()
   formData.append('image', imageBlob, 'question.jpg')
@@ -182,7 +228,8 @@ export const solveQuestionStream = async (
   const response = await fetch(`${API_BASE}${endpoint}`, {
     method: 'POST',
     body: formData,
-    headers: { 'X-AAS-Fingerprint': fingerprint, ...buildApiOverrideHeaders(apiConfig) }
+    headers: { 'X-AAS-Fingerprint': fingerprint, ...buildApiOverrideHeaders(apiConfig) },
+    signal
   })
 
   if (!response.ok) {
@@ -273,7 +320,8 @@ export const solveQuestionMultiStream = async (
   onUsage?: (usage: UsageInfo) => void,
   apiConfig?: ApiConfig,
   mode?: 'single' | 'debate' | 'auto',
-  subject?: 'science' | 'humanities' | 'unknown'
+  subject?: 'science' | 'humanities' | 'unknown',
+  signal?: AbortSignal
 ): Promise<SolveQuestionResponse> => {
   const formData = new FormData()
   for (const [index, blob] of imageBlobs.entries()) {
@@ -295,7 +343,8 @@ export const solveQuestionMultiStream = async (
   const response = await fetch(`${API_BASE}${endpoint}`, {
     method: 'POST',
     body: formData,
-    headers: { 'X-AAS-Fingerprint': fingerprint, ...buildApiOverrideHeaders(apiConfig) }
+    headers: { 'X-AAS-Fingerprint': fingerprint, ...buildApiOverrideHeaders(apiConfig) },
+    signal
   })
 
   if (!response.ok) {
@@ -307,6 +356,113 @@ export const solveQuestionMultiStream = async (
 
   if (!response.body) {
     // 目前仅实现了流式版本，多图情况下 body 不存在则直接报错
+    throw new Error('服务器未返回流式响应')
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+  let finalResult: SolveQuestionResponse | null = null
+  let lastCompleteResult: SolveQuestionResponse | null = null
+
+  const processChunk = (chunk: string) => {
+    const lines = chunk.split('\n')
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue
+      const raw = line.replace(/^data:\s*/, '')
+      if (!raw) continue
+      let event: StreamEvent
+      try {
+        event = JSON.parse(raw) as StreamEvent
+      } catch {
+        continue
+      }
+      onEvent(event)
+      if (event.type === 'complete' && event.result) {
+        lastCompleteResult = event.result
+        if (!finalResult) {
+          finalResult = event.result
+        }
+      }
+      if (event.type === 'final' && event.result) {
+        finalResult = event.result
+        if (event.usage) onUsage?.(event.usage)
+      }
+      if (event.type === 'error' && event.message) {
+        throw new Error(event.message)
+      }
+    }
+  }
+
+  const processBuffer = () => {
+    let splitIndex = buffer.indexOf('\n\n')
+    while (splitIndex !== -1) {
+      const chunk = buffer.slice(0, splitIndex)
+      buffer = buffer.slice(splitIndex + 2)
+      splitIndex = buffer.indexOf('\n\n')
+      processChunk(chunk)
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
+    processBuffer()
+  }
+
+  buffer += decoder.decode().replace(/\r\n/g, '\n')
+  processBuffer()
+
+  if (buffer.trim()) {
+    processChunk(buffer)
+  }
+
+  if (!finalResult && lastCompleteResult) {
+    finalResult = lastCompleteResult
+  }
+
+  if (!finalResult) {
+    throw new Error('未收到最终结果')
+  }
+
+  return finalResult
+}
+
+export const solveQuestionTextStream = async (
+  text: string,
+  onEvent: (event: StreamEvent) => void,
+  onUsage?: (usage: UsageInfo) => void,
+  apiConfig?: ApiConfig,
+  mode?: 'single' | 'debate' | 'auto',
+  subject?: 'science' | 'humanities' | 'unknown',
+  signal?: AbortSignal
+): Promise<SolveQuestionResponse> => {
+  const payload: Record<string, unknown> = { text }
+  if (mode) payload.mode = mode
+  if (subject) payload.subject = subject
+
+  const endpoint = '/solve-text-auto-stream'
+  const fingerprint = await getFingerprintId()
+  const response = await fetch(`${API_BASE}${endpoint}`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    headers: {
+      'Content-Type': 'application/json',
+      'X-AAS-Fingerprint': fingerprint,
+      ...buildApiOverrideHeaders(apiConfig)
+    },
+    signal
+  })
+
+  if (!response.ok) {
+    throw new Error(await parseResponseErrorMessage(response))
+  }
+
+  const usage = getUsageInfoFromHeaders(response.headers)
+  if (usage) onUsage?.(usage)
+
+  if (!response.body) {
     throw new Error('服务器未返回流式响应')
   }
 

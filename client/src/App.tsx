@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Upload,
   Button,
   Card,
   message,
@@ -15,10 +14,10 @@ import {
   Select,
   Progress,
   Input,
-  AutoComplete
+  AutoComplete,
+  Radio
 } from 'antd'
-import { UploadOutlined, SendOutlined, DeleteOutlined, DownloadOutlined, LinkOutlined } from '@ant-design/icons'
-import type { UploadFile } from 'antd'
+import { SendOutlined, DeleteOutlined, DownloadOutlined, LinkOutlined } from '@ant-design/icons'
 import MultiCropper, { CropBox, CropGroups, ModelMode } from './components/MultiCropper'
 import MarkdownView from './components/MarkdownView'
 import KnowledgeBasePanel from './components/KnowledgeBasePanel'
@@ -27,6 +26,7 @@ import {
   getAvailableModels,
   getUsage,
   solveQuestionMultiStream,
+  solveQuestionTextStream,
   StreamEvent,
   SolveQuestionResponse,
   type ApiConfig,
@@ -50,16 +50,19 @@ type ImageItem = {
   activeCropId: string
 }
 
+type SubjectiveAnswerStyle = 'outline' | 'standard' | 'full'
+
 type SolveTask = {
   id: string
   createdAt: number
   imageId: string
   title: string
   mode: ModelMode
-  status: 'pending' | 'running' | 'done' | 'error'
+  status: 'pending' | 'running' | 'done' | 'error' | 'canceled'
   streamText: string
   result?: SolveQuestionResponse
   error?: string
+  subjectiveAnswerStyle?: SubjectiveAnswerStyle
   followUps: FollowUpMessage[]
   followUpDraft: string
   followUpSending: boolean
@@ -83,9 +86,12 @@ const createId = () =>
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`
 
 function App() {
-  const [fileList, setFileList] = useState<UploadFile[]>([])
   const [images, setImages] = useState<ImageItem[]>([])
   const [activeImageId, setActiveImageId] = useState<string>('')
+  const [questionDraft, setQuestionDraft] = useState('')
+  const [questionMode, setQuestionMode] = useState<ModelMode>('auto')
+  const [questionSubject, setQuestionSubject] = useState<ImageItem['subject']>('unknown')
+  const imagePickerRef = useRef<HTMLInputElement | null>(null)
 
   const [tasks, setTasks] = useState<SolveTask[]>([])
   const [taskDrawerOpen, setTaskDrawerOpen] = useState(false)
@@ -95,11 +101,30 @@ function App() {
   const [apiConfigEnabled, setApiConfigEnabled] = useState(false)
   const [apiKey, setApiKey] = useState('')
   const [apiBaseUrl, setApiBaseUrl] = useState('')
-  const [apiModel, setApiModel] = useState('')
+  const [apiSingleModel, setApiSingleModel] = useState('')
+  const [apiDebateModel1, setApiDebateModel1] = useState('')
+  const [apiDebateModel2, setApiDebateModel2] = useState('')
+  const [apiRouterModel, setApiRouterModel] = useState('')
   const [availableModels, setAvailableModels] = useState<string[]>([])
   const [availableModelsLoading, setAvailableModelsLoading] = useState(false)
   const [customAvailableModels, setCustomAvailableModels] = useState<string[]>([])
   const fileImportRef = useRef<HTMLInputElement | null>(null)
+  const [maxConcurrentTasks, setMaxConcurrentTasks] = useState(2)
+  const taskPayloadsRef = useRef<
+    Record<
+      string,
+      {
+        kind: 'images' | 'text'
+        blobs?: Blob[]
+        prompt?: string
+        text?: string
+        subject: ImageItem['subject']
+        apiConfig?: ApiConfig
+      }
+    >
+  >({})
+  const taskControllersRef = useRef<Record<string, AbortController>>({})
+  const schedulerTickingRef = useRef(false)
   const [crossImageMergeEnabled, setCrossImageMergeEnabled] = useState(true)
   const [crossImageMergeOverrides, setCrossImageMergeOverrides] = useState<Record<string, CrossImageMergeOverride>>({})
   const [crossImageMergeModalOpen, setCrossImageMergeModalOpen] = useState(false)
@@ -120,21 +145,46 @@ function App() {
     const key = apiKey.trim()
     if (!key) return undefined
     const baseUrl = apiBaseUrl.trim()
-    const model = apiModel.trim()
-    return { apiKey: key, baseUrl: baseUrl || undefined, model: model || undefined }
-  }, [apiConfigEnabled, apiKey, apiBaseUrl, apiModel])
+    const singleModel = apiSingleModel.trim()
+    const debateModel1 = apiDebateModel1.trim()
+    const debateModel2 = apiDebateModel2.trim()
+    const routerModel = apiRouterModel.trim()
+    const modelCandidates = [...new Set([...customAvailableModels, ...availableModels].map((m) => m.trim()).filter(Boolean))]
+
+    return {
+      apiKey: key,
+      baseUrl: baseUrl || undefined,
+      singleModel: singleModel || undefined,
+      debateModel1: debateModel1 || undefined,
+      debateModel2: debateModel2 || undefined,
+      routerModel: routerModel || undefined,
+      modelCandidates: modelCandidates.length ? modelCandidates : undefined
+    }
+  }, [
+    apiConfigEnabled,
+    apiKey,
+    apiBaseUrl,
+    apiSingleModel,
+    apiDebateModel1,
+    apiDebateModel2,
+    apiRouterModel,
+    customAvailableModels,
+    availableModels
+  ])
 
   const refreshAvailableModels = useCallback(async () => {
     setAvailableModelsLoading(true)
     try {
-      const models = await getAvailableModels()
+      const key = apiKey.trim()
+      const baseUrl = apiBaseUrl.trim()
+      const models = await getAvailableModels(key ? { apiKey: key, baseUrl: baseUrl || undefined } : undefined)
       setAvailableModels(models)
     } catch (e) {
       message.error(e instanceof Error ? e.message : '获取模型列表失败')
     } finally {
       setAvailableModelsLoading(false)
     }
-  }, [])
+  }, [apiBaseUrl, apiKey])
 
   useEffect(() => {
     if (!apiConfigOpen) return
@@ -146,7 +196,10 @@ function App() {
       enabled: apiConfigEnabled,
       apiKey: apiKey.trim(),
       baseUrl: apiBaseUrl.trim() || undefined,
-      model: apiModel.trim() || undefined,
+      singleModel: apiSingleModel.trim() || undefined,
+      debateModel1: apiDebateModel1.trim() || undefined,
+      debateModel2: apiDebateModel2.trim() || undefined,
+      routerModel: apiRouterModel.trim() || undefined,
       availableModels: customAvailableModels
     }
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
@@ -177,7 +230,25 @@ function App() {
         : typeof data.baseURL === 'string'
           ? data.baseURL
           : ''
-    const importedModel = typeof data.model === 'string' ? data.model : ''
+    const importedSingleModel =
+      typeof data.singleModel === 'string'
+        ? data.singleModel
+        : typeof data.model === 'string'
+          ? data.model
+          : ''
+    const importedDebateModel1 =
+      typeof data.debateModel1 === 'string'
+        ? data.debateModel1
+        : typeof data.model === 'string'
+          ? data.model
+          : ''
+    const importedDebateModel2 =
+      typeof data.debateModel2 === 'string'
+        ? data.debateModel2
+        : typeof data.model === 'string'
+          ? data.model
+          : ''
+    const importedRouterModel = typeof data.routerModel === 'string' ? data.routerModel : ''
     const importedAvailableModels = Array.isArray(data.availableModels)
       ? data.availableModels.filter((x: unknown) => typeof x === 'string').map((x: string) => x.trim()).filter(Boolean)
       : []
@@ -185,12 +256,15 @@ function App() {
     setApiConfigEnabled(enabled)
     setApiKey(importedKey)
     setApiBaseUrl(importedBase)
-    setApiModel(importedModel)
+    setApiSingleModel(importedSingleModel)
+    setApiDebateModel1(importedDebateModel1)
+    setApiDebateModel2(importedDebateModel2)
+    setApiRouterModel(importedRouterModel)
     setCustomAvailableModels(importedAvailableModels)
     message.success('已导入配置')
   }
 
-  const handleUpload = (file: File) => {
+  const addImageFile = (file: File) => {
     const id = createId()
     const url = URL.createObjectURL(file)
     const firstCropId = createId()
@@ -215,11 +289,6 @@ function App() {
 
     setImages((prev) => [...prev, newImage])
     setActiveImageId((prev) => prev || id)
-    setFileList((prev) => [
-      ...prev,
-      { uid: id, name: file.name, status: 'done', originFileObj: file } as UploadFile
-    ])
-    return false
   }
 
   const removeImage = (id: string) => {
@@ -230,7 +299,6 @@ function App() {
       if (activeImageId === id) setActiveImageId(next[0]?.id || '')
       return next
     })
-    setFileList((prev) => prev.filter((f) => f.uid !== id))
     setCrossImageMergeOverrides((prev) => {
       const next: Record<string, CrossImageMergeOverride> = {}
       for (const [toImageId, rule] of Object.entries(prev)) {
@@ -248,7 +316,6 @@ function App() {
     }
     setImages([])
     setActiveImageId('')
-    setFileList([])
     setTasks([])
     setCrossImageMergeOverrides({})
     setCrossImageMergeModalOpen(false)
@@ -269,6 +336,103 @@ function App() {
     }
     lines.push(...groupCrops.map((c, idx) => `区域${idx + 1}：${c.label} - ${c.title || `题目 ${idx + 1}`}`))
     return lines.join('\n')
+  }
+
+  const subjectiveStyleStorageKey = 'aas-subjective-answer-style'
+
+  const parseSubjectiveAnswerStyle = (value: unknown): SubjectiveAnswerStyle | undefined => {
+    if (value === 'outline' || value === 'standard' || value === 'full') return value
+    return undefined
+  }
+
+  const getSubjectiveStyleLabel = (style: SubjectiveAnswerStyle) =>
+    style === 'outline' ? '提纲/要点' : style === 'full' ? '成文作答' : '标准答题'
+
+  const isLikelySubjectiveQuestion = (questionText: string): boolean => {
+    const q = (questionText || '').trim()
+    if (!q) return false
+
+    const essayLike =
+      /(作文|写作|命题作文|材料作文|读后感|演讲稿|书信|写一篇|以.+为题|不少于\s*\d+\s*字|字数\s*(不少于|不少于)|write\s+(an|a)\s+(essay|composition|passage|article|story|letter)|essay|composition)/i
+    const openEnded =
+      /(谈谈|谈一谈|谈谈你的看法|阐述|论述|结合.+(分析|谈|说明)|简答|简述|说明理由|开放性|自拟题目)/i
+
+    return essayLike.test(q) || openEnded.test(q)
+  }
+
+  const buildSubjectiveStylePrompt = (style: SubjectiveAnswerStyle) => {
+    if (style === 'outline') {
+      return [
+        '如果题目属于主观题/作文/论述题，请按【提纲/要点】作答：',
+        '- 先给出立意/核心观点（1-2 句）。',
+        '- 给出结构化提纲（分点/分段），每点写清要写什么。',
+        '- 如题目有字数/体裁/角度限制，请严格遵守并在提纲里体现。',
+        '- 不要直接给完整正文（除非题目明确要求必须写成文）。'
+      ].join('\n')
+    }
+    if (style === 'full') {
+      return [
+        '如果题目属于主观题/作文/论述题，请按【成文作答】作答：',
+        '- 先给出立意/核心观点（1-2 句）。',
+        '- 再输出一份可直接抄写的完整正文（分段清晰）。',
+        '- 如有字数/题目/体裁要求，请严格满足；若未给字数，优先给中等篇幅。'
+      ].join('\n')
+    }
+    return [
+      '如果题目属于主观题/简答/论述题，请按【标准答题】作答：',
+      '- 分点作答（要点+展开解释/例子），层次清晰。',
+      '- 结尾给 1-2 句总结；如有评分点，尽量覆盖。'
+    ].join('\n')
+  }
+
+  const askSubjectiveAnswerStyle = (questionText: string): Promise<SubjectiveAnswerStyle | null> => {
+    const saved = (() => {
+      try {
+        return parseSubjectiveAnswerStyle(localStorage.getItem(subjectiveStyleStorageKey))
+      } catch {
+        return undefined
+      }
+    })()
+
+    return new Promise((resolve) => {
+      let selected: SubjectiveAnswerStyle = saved || 'standard'
+      const preview = (questionText || '').replace(/\s+/g, ' ').trim().slice(0, 120)
+
+      Modal.confirm({
+        title: '检测到主观题',
+        content: (
+          <div>
+            <div style={{ color: 'rgba(0,0,0,0.65)', marginBottom: 8 }}>请选择更适合的作答方式：</div>
+            {!!preview && (
+              <div style={{ fontSize: 12, color: 'rgba(0,0,0,0.45)', marginBottom: 12 }}>题目预览：{preview}…</div>
+            )}
+            <Radio.Group
+              defaultValue={selected}
+              onChange={(e) => {
+                selected = e.target.value as SubjectiveAnswerStyle
+              }}
+            >
+              <Space direction="vertical">
+                <Radio value="outline">提纲/要点（先给思路，不直接成文）</Radio>
+                <Radio value="standard">标准答题（分点 + 展开，适合考试）</Radio>
+                <Radio value="full">成文作答（作文/论述完整正文）</Radio>
+              </Space>
+            </Radio.Group>
+          </div>
+        ),
+        okText: '继续',
+        cancelText: '取消',
+        onOk: () => {
+          try {
+            localStorage.setItem(subjectiveStyleStorageKey, selected)
+          } catch {
+            // ignore
+          }
+          resolve(selected)
+        },
+        onCancel: () => resolve(null)
+      })
+    })
   }
 
   const openCrossImageMergeModal = () => {
@@ -312,82 +476,232 @@ function App() {
     message.success('已清除自定义跨图合并规则')
   }
 
-  const runTask = async (task: SolveTask, blobs: Blob[], prompt: string, subject: ImageItem['subject']) => {
+  const enqueueTask = (
+    task: SolveTask,
+    payload:
+      | { kind: 'images'; blobs: Blob[]; prompt: string; subject: ImageItem['subject'] }
+      | { kind: 'text'; text: string; subject: ImageItem['subject'] }
+  ) => {
+    taskPayloadsRef.current[task.id] = { ...payload, apiConfig: activeApiConfig }
+    setTasks((prev) => [task, ...prev])
     setTaskDrawerOpen(true)
+  }
 
-    const sanitize = (text: string) => text.replace(/<\/?think>/g, '')
-
-    try {
-      if (apiConfigEnabled && !apiKey.trim()) {
-        message.error('已开启自定义 API，但未填写 API Key')
-        return
-      }
-      const response = await solveQuestionMultiStream(
-        blobs,
-        prompt,
-        (event: StreamEvent) => {
-        setTasks((prev) =>
-          prev.map((t) => {
-            if (t.id !== task.id) return t
-            if (event.type === 'start') return { ...t, streamText: '' }
-            if (event.type === 'delta' && event.value) return { ...t, streamText: t.streamText + sanitize(event.value) }
-            if (event.type === 'model1' && event.content)
-              return {
-                ...t,
-                streamText: `${t.streamText}\n\n[模型1 · 第${event.iteration ?? 0}轮]\n${sanitize(event.content)}\n`
-              }
-            if (event.type === 'model2' && event.content)
-              return {
-                ...t,
-                streamText: `${t.streamText}\n\n[模型2 · 第${event.iteration ?? 0}轮]\n${sanitize(event.content)}\n`
-              }
-            if (event.type === 'status' && event.message)
-              return { ...t, streamText: `${t.streamText}\n\n${sanitize(event.message)}\n` }
-            if (event.type === 'complete' && event.value) {
-              return { ...t, streamText: t.streamText ? t.streamText : sanitize(event.value) }
-            }
-            if (event.type === 'final') {
-              return { ...t, streamText: `${t.streamText}\n\n[最终答案]\n${sanitize(event.result.answer)}\n` }
-            }
-            return t
-          })
-        )
-        },
-        (u) => setUsageInfo(u),
-        activeApiConfig,
-        task.mode,
-        subject
+  const cancelTask = (taskId: string) => {
+    const controller = taskControllersRef.current[taskId]
+    if (controller) controller.abort()
+    setTasks((prev) =>
+      prev.map((t) =>
+        t.id === taskId && (t.status === 'pending' || t.status === 'running')
+          ? { ...t, status: 'canceled', error: '已取消' }
+          : t
       )
+    )
+  }
+
+  const cancelAllTasks = () => {
+    const ids = tasks.filter((t) => t.status === 'pending' || t.status === 'running').map((t) => t.id)
+    ids.forEach(cancelTask)
+  }
+
+  const deleteTask = (taskId: string) => {
+    cancelTask(taskId)
+    delete taskControllersRef.current[taskId]
+    delete taskPayloadsRef.current[taskId]
+    setTasks((prev) => prev.filter((t) => t.id !== taskId))
+  }
+
+  const retryTask = (taskId: string) => {
+    if (!taskPayloadsRef.current[taskId]) {
+      message.warning('无法重试：缺少任务输入（请重新裁剪并发起解题）')
+      return
+    }
+    setTasks((prev) =>
+      prev.map((t) =>
+        t.id === taskId
+          ? {
+              ...t,
+              status: 'pending',
+              streamText: '',
+              result: undefined,
+              error: undefined,
+              followUps: [],
+              followUpDraft: '',
+              followUpSending: false
+            }
+          : t
+      )
+    )
+  }
+
+  const retryFailedTasks = () => {
+    const ids = tasks.filter((t) => t.status === 'error' || t.status === 'canceled').map((t) => t.id)
+    ids.forEach(retryTask)
+  }
+
+  const startQueuedTask = useCallback(
+    async (taskId: string) => {
+      const payload = taskPayloadsRef.current[taskId]
+      const task = tasks.find((t) => t.id === taskId)
+      if (!payload || !task) return
+
+      const controller = new AbortController()
+      taskControllersRef.current[taskId] = controller
+
+      const sanitize = (text: string) => text.replace(/<\/?think>/g, '')
 
       setTasks((prev) =>
-        prev.map((t) =>
-          t.id === task.id
-            ? {
-                ...t,
-                status: 'done',
-                result: response
-              }
-            : t
-        )
+        prev.map((t) => (t.id === taskId ? { ...t, status: 'running', streamText: '', error: undefined } : t))
       )
+
       try {
-        setUsageInfo(await getUsage())
-      } catch {
-        // ignore
+        const onEvent = (event: StreamEvent) => {
+          setTasks((prev) =>
+            prev.map((t) => {
+              if (t.id !== taskId) return t
+              if (t.status === 'canceled') return t
+              if (event.type === 'start') return { ...t, streamText: '' }
+              if (event.type === 'delta' && event.value) return { ...t, streamText: t.streamText + sanitize(event.value) }
+              if (event.type === 'model1' && event.content)
+                return {
+                  ...t,
+                  streamText: `${t.streamText}\n\n[模型1 · 第${event.iteration ?? 0}轮]\n${sanitize(event.content)}\n`
+                }
+              if (event.type === 'model2' && event.content)
+                return {
+                  ...t,
+                  streamText: `${t.streamText}\n\n[模型2 · 第${event.iteration ?? 0}轮]\n${sanitize(event.content)}\n`
+                }
+              if (event.type === 'status' && event.message) return { ...t, streamText: `${t.streamText}\n\n${sanitize(event.message)}\n` }
+              if (event.type === 'complete' && event.value) {
+                return { ...t, streamText: t.streamText ? t.streamText : sanitize(event.value) }
+              }
+              if (event.type === 'final') {
+                return { ...t, streamText: `${t.streamText}\n\n[最终答案]\n${sanitize(event.result.answer)}\n` }
+              }
+              return t
+            })
+          )
+        }
+
+        const response =
+          payload.kind === 'text'
+            ? await solveQuestionTextStream(
+                payload.text || '',
+                onEvent,
+                (u) => setUsageInfo(u),
+                payload.apiConfig,
+                task.mode,
+                payload.subject,
+                controller.signal
+              )
+            : await solveQuestionMultiStream(
+                payload.blobs || [],
+                payload.prompt,
+                onEvent,
+                (u) => setUsageInfo(u),
+                payload.apiConfig,
+                task.mode,
+                payload.subject,
+                controller.signal
+              )
+
+        if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError')
+
+        let finalResponse = response
+        let subjectiveStyle: SubjectiveAnswerStyle | undefined = undefined
+
+        if (maxConcurrentTasks === 1 && isLikelySubjectiveQuestion(response.question)) {
+          const chosen = await askSubjectiveAnswerStyle(response.question)
+          if (chosen) {
+            subjectiveStyle = chosen
+            setTasks((prev) =>
+              prev.map((t) => (t.id === taskId ? { ...t, status: 'running', subjectiveAnswerStyle: chosen, result: response } : t))
+            )
+
+            if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError')
+
+            try {
+              const followUpMode = (response as any)?.routedMode === 'debate' ? 'debate' : 'single'
+              const follow = await followUpQuestion(
+                {
+                  baseQuestion: response.question,
+                  baseAnswer: response.answer,
+                  prompt: buildSubjectiveStylePrompt(chosen),
+                  mode: followUpMode,
+                  routedSubject: (response as any)?.routedSubject
+                },
+                payload.apiConfig
+              )
+
+              const mergedTokensUsed =
+                typeof response.tokensUsed === 'number' && typeof follow.tokensUsed === 'number'
+                  ? response.tokensUsed + follow.tokensUsed
+                  : typeof response.tokensUsed === 'number'
+                    ? response.tokensUsed
+                    : typeof follow.tokensUsed === 'number'
+                      ? follow.tokensUsed
+                      : undefined
+
+              finalResponse = {
+                ...response,
+                answer: follow.answer,
+                ...(typeof mergedTokensUsed === 'number' ? { tokensUsed: mergedTokensUsed } : {})
+              }
+            } catch (e) {
+              subjectiveStyle = undefined
+              setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, subjectiveAnswerStyle: undefined } : t)))
+              message.error(e instanceof Error ? e.message : '主观题答案生成失败（已保留原答案）')
+            }
+          }
+        }
+
+        setTasks((prev) =>
+          prev.map((t) =>
+            t.id === taskId
+              ? { ...t, status: 'done', result: finalResponse, subjectiveAnswerStyle: subjectiveStyle || t.subjectiveAnswerStyle }
+              : t
+          )
+        )
+        try {
+          setUsageInfo(await getUsage())
+        } catch {
+          // ignore
+        }
+      } catch (error) {
+        if ((error as any)?.name === 'AbortError') {
+          setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, status: 'canceled', error: '已取消' } : t)))
+          return
+        }
+        const errorMessage = error instanceof Error ? error.message : '解答失败，请重试'
+        setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, status: 'error', error: errorMessage } : t)))
+        message.error(errorMessage)
+      } finally {
+        delete taskControllersRef.current[taskId]
       }
-      message.success('自动路由完成！')
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : '解答失败，请重试'
-      setTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, status: 'error', error: errorMessage } : t)))
-      message.error(errorMessage)
-      console.error(error)
-      try {
-        setUsageInfo(await getUsage())
-      } catch {
-        // ignore
-      }
+    },
+    [tasks, maxConcurrentTasks]
+  )
+
+  useEffect(() => {
+    if (schedulerTickingRef.current) return
+    schedulerTickingRef.current = true
+
+    try {
+      const running = tasks.filter((t) => t.status === 'running').length
+      const slots = Math.max(0, maxConcurrentTasks - running)
+      if (!slots) return
+
+      const toStart = tasks
+        .filter((t) => t.status === 'pending')
+        .slice(0, slots)
+        .map((t) => t.id)
+
+      toStart.forEach((id) => void startQueuedTask(id))
+    } finally {
+      schedulerTickingRef.current = false
     }
-  }
+  }, [tasks, maxConcurrentTasks, startQueuedTask])
 
   useEffect(() => {
     if (!taskDrawerOpen) return
@@ -570,12 +884,20 @@ function App() {
           return
         }
         const key = groupKey(toCrop)
-        addToGroup(key, {
-          image: prevImage,
-          crop: fromCrop,
-          label: prevImage.name,
-          order: (activeImageIndex - 1) * 10_000 + Math.max(prevImage.crops.findIndex((c) => c.id === fromCrop.id), 0)
-        })
+        const prevCropOrder = new Map<string, number>()
+        prevImage.crops.forEach((c, idx) => prevCropOrder.set(c.id, idx))
+
+        const fromKey = groupKey(fromCrop)
+        const fromGroupCrops = prevImage.crops.filter((c) => groupKey(c) === fromKey)
+
+        for (const c of fromGroupCrops) {
+          addToGroup(key, {
+            image: prevImage,
+            crop: c,
+            label: prevImage.name,
+            order: (activeImageIndex - 1) * 10_000 + (prevCropOrder.get(c.id) ?? 0)
+          })
+        }
       }
     }
 
@@ -676,7 +998,7 @@ function App() {
         imageId: activeImage.id,
         title,
         mode: selectedMode,
-        status: 'running',
+        status: 'pending',
         streamText: '',
         followUps: [],
          followUpDraft: '',
@@ -686,8 +1008,7 @@ function App() {
         title,
         groupCrops.map((x) => ({ label: x.label, title: x.crop.title }))
       )
-      setTasks((prev) => [task, ...prev])
-      runTask(task, blobs, prompt, activeImage.subject)
+      enqueueTask(task, { kind: 'images', blobs, prompt, subject: activeImage.subject })
     }
   }
 
@@ -767,19 +1088,104 @@ function App() {
 
       <main className="app-main">
         <Card className="upload-card">
-          <Upload.Dragger
-            fileList={fileList}
-            beforeUpload={handleUpload}
+          <input
+            ref={imagePickerRef}
+            type="file"
             accept="image/*"
             multiple
-            showUploadList={false}
-          >
-            <p className="ant-upload-drag-icon">
-              <UploadOutlined />
-            </p>
-            <p className="ant-upload-text">点击或拖拽多张图片到此区域上传</p>
-            <p className="ant-upload-hint">支持 JPG、PNG、WebP 等图片格式</p>
-          </Upload.Dragger>
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const files = Array.from(e.target.files || []).filter((f) => f.type.startsWith('image/'))
+              e.target.value = ''
+              if (!files.length) return
+              files.forEach(addImageFile)
+              message.success(`已添加 ${files.length} 张图片`)
+            }}
+          />
+
+          <Space direction="vertical" style={{ width: '100%' }} size="middle">
+            <Input.TextArea
+              value={questionDraft}
+              onChange={(e) => setQuestionDraft(e.target.value)}
+              placeholder="输入题目文字提问（也可把图片拖到这里/粘贴截图）"
+              autoSize={{ minRows: 4, maxRows: 10 }}
+              onPaste={(e) => {
+                const files = Array.from(e.clipboardData?.files || []).filter((f) => f.type.startsWith('image/'))
+                if (!files.length) return
+                files.forEach(addImageFile)
+                message.success(`已添加 ${files.length} 张图片（来自粘贴）`)
+              }}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault()
+                const files = Array.from(e.dataTransfer?.files || []).filter((f) => f.type.startsWith('image/'))
+                if (!files.length) return
+                files.forEach(addImageFile)
+                message.success(`已添加 ${files.length} 张图片（来自拖拽）`)
+              }}
+            />
+
+            <Space wrap style={{ justifyContent: 'space-between' }}>
+              <Space wrap>
+                <Button onClick={() => imagePickerRef.current?.click()}>选择图片</Button>
+                <Select
+                  value={questionMode}
+                  onChange={(v) => setQuestionMode(v as ModelMode)}
+                  style={{ width: 160 }}
+                  options={[
+                    { value: 'auto', label: '自动路由' },
+                    { value: 'single', label: '单模型' },
+                    { value: 'debate', label: '双模型' }
+                  ]}
+                />
+                <Select
+                  value={questionSubject}
+                  onChange={(v) => setQuestionSubject(v as ImageItem['subject'])}
+                  style={{ width: 180 }}
+                  options={[
+                    { value: 'unknown', label: '不确定（推荐）' },
+                    { value: 'science', label: '理科' },
+                    { value: 'humanities', label: '文科' }
+                  ]}
+                />
+              </Space>
+
+              <Button
+                type="primary"
+                icon={<SendOutlined />}
+                onClick={() => {
+                  const text = questionDraft.trim()
+                  if (!text) {
+                    message.warning('请先输入题目文字')
+                    return
+                  }
+                  if (apiConfigEnabled && !apiKey.trim()) {
+                    message.error('已开启自定义 API，但未填写 API Key')
+                    return
+                  }
+
+                  const title = text.replace(/\s+/g, ' ').slice(0, 24) || '文字题目'
+                  const task: SolveTask = {
+                    id: createId(),
+                    createdAt: Date.now(),
+                    imageId: '',
+                    title,
+                    mode: questionMode,
+                    status: 'pending',
+                    streamText: '',
+                    followUps: [],
+                    followUpDraft: '',
+                    followUpSending: false
+                  }
+
+                  enqueueTask(task, { kind: 'text', text, subject: questionSubject })
+                  setQuestionDraft('')
+                }}
+              >
+                发送文字提问
+              </Button>
+            </Space>
+          </Space>
 
           <div style={{ marginTop: 16 }}>
             <KnowledgeBasePanel files={knowledgeBaseFiles} onFilesChange={setKnowledgeBaseFiles} />
@@ -787,7 +1193,7 @@ function App() {
 
           <div className="action-buttons" style={{ justifyContent: 'space-between' }}>
             <Button onClick={() => setApiConfigOpen(true)}>自定义 API（临时）{apiConfigEnabled ? '：已开启' : ''}</Button>
-            {images.length > 0 && (
+            {(images.length > 0 || tasks.length > 0) && (
               <Button danger icon={<DeleteOutlined />} onClick={resetAll}>
                 清空所有图片与结果
               </Button>
@@ -912,11 +1318,37 @@ function App() {
             <div style={{ marginBottom: 16, color: 'rgba(0,0,0,0.45)' }}>Token 用量限制未开启</div>
           )}
 
+          <div style={{ marginBottom: 16 }}>
+            <Space wrap>
+              <span>并发</span>
+              <Select
+                value={maxConcurrentTasks}
+                onChange={(v) => setMaxConcurrentTasks(v)}
+                style={{ width: 120 }}
+                options={[1, 2, 3, 4].map((n) => ({ value: n, label: `${n}` }))}
+              />
+              <Button onClick={cancelAllTasks} disabled={!tasks.some((t) => t.status === 'pending' || t.status === 'running')}>
+                取消全部
+              </Button>
+              <Button onClick={retryFailedTasks} disabled={!tasks.some((t) => t.status === 'error' || t.status === 'canceled')}>
+                重试失败
+              </Button>
+            </Space>
+          </div>
+
           <Collapse
             accordion={false}
             items={tasks.map((task) => {
               const statusColor =
-                task.status === 'done' ? 'success' : task.status === 'error' ? 'error' : task.status === 'running' ? 'processing' : 'default'
+                task.status === 'done'
+                  ? 'success'
+                  : task.status === 'error'
+                    ? 'error'
+                    : task.status === 'running'
+                      ? 'processing'
+                      : task.status === 'canceled'
+                        ? 'warning'
+                        : 'default'
               const modeLabel = task.mode === 'auto' ? '自动' : task.mode === 'single' ? '单模型' : '双模型'
               const modeColor = task.mode === 'auto' ? 'blue' : task.mode === 'single' ? 'green' : 'purple'
               const routedSubject = (task.result as any)?.routedSubject
@@ -935,6 +1367,9 @@ function App() {
                     <Space size="small">
                       <Tag color={modeColor}>{modeLabel}</Tag>
                       {!!routedLabel && <Tag color="geekblue">{routedLabel}</Tag>}
+                      {!!task.subjectiveAnswerStyle && (
+                        <Tag color="gold">主观题：{getSubjectiveStyleLabel(task.subjectiveAnswerStyle)}</Tag>
+                      )}
                       {typeof task.result?.tokensUsed === 'number' && <Tag color="purple">{task.result.tokensUsed} tokens</Tag>}
                       <Tag color={statusColor}>{task.status}</Tag>
                     </Space>
@@ -942,6 +1377,21 @@ function App() {
                 ),
                 children: (
                   <div className="task-body">
+                    <Space wrap style={{ marginBottom: 8 }}>
+                      {(task.status === 'pending' || task.status === 'running') && (
+                        <Button danger size="small" onClick={() => cancelTask(task.id)}>
+                          取消
+                        </Button>
+                      )}
+                      {(task.status === 'error' || task.status === 'canceled') && (
+                        <Button size="small" onClick={() => retryTask(task.id)}>
+                          重试
+                        </Button>
+                      )}
+                      <Button size="small" onClick={() => deleteTask(task.id)}>
+                        移除
+                      </Button>
+                    </Space>
                     {task.error && <div className="task-error">{task.error}</div>}
                     <Collapse
                       className="stream-collapse"
@@ -1077,7 +1527,7 @@ function App() {
             ) : (
               <Space direction="vertical" style={{ width: '100%' }}>
                 <div style={{ color: 'rgba(0,0,0,0.45)' }}>
-                  默认规则：上一张图片的最后一个题目合并到本图的第一个题目（开启时生效）。可在下方自定义覆盖。
+                  默认规则：上一张图片的最后一个裁剪框（及其合并组）合并到本图的第一个裁剪框（及其合并组）（开启时生效）。可在下方自定义覆盖。
                 </div>
                 <div>
                   <div style={{ marginBottom: 8 }}>上一张图片题目</div>
@@ -1118,7 +1568,10 @@ function App() {
                   setApiConfigEnabled(false)
                   setApiKey('')
                   setApiBaseUrl('')
-                  setApiModel('')
+                  setApiSingleModel('')
+                  setApiDebateModel1('')
+                  setApiDebateModel2('')
+                  setApiRouterModel('')
                 }}
               >
                 清空
@@ -1181,23 +1634,77 @@ function App() {
                 style={{ width: '100%', marginBottom: 8 }}
                 options={[...new Set([...customAvailableModels, ...availableModels])].map((m) => ({ value: m, label: m }))}
               />
-              <AutoComplete
-                value={apiModel}
-                onChange={setApiModel}
-                placeholder="gpt-4o-mini"
-                options={[...new Set([...customAvailableModels, ...availableModels])].map((m) => ({ value: m, label: m }))}
-                filterOption={(input, option) =>
-                  (option?.value ?? '')
-                    .toString()
-                    .toLowerCase()
-                    .includes(input.toLowerCase())
-                }
-              />
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8 }}>
+                <div>
+                  <div style={{ marginBottom: 6, color: 'rgba(0,0,0,0.65)' }}>单模型（不填则随机）</div>
+                  <AutoComplete
+                    value={apiSingleModel}
+                    onChange={setApiSingleModel}
+                    placeholder="例如：gpt-4o-mini"
+                    style={{ width: '100%' }}
+                    options={[...new Set([...customAvailableModels, ...availableModels])].map((m) => ({ value: m, label: m }))}
+                    filterOption={(input, option) =>
+                      (option?.value ?? '')
+                        .toString()
+                        .toLowerCase()
+                        .includes(input.toLowerCase())
+                    }
+                  />
+                </div>
+                <div>
+                  <div style={{ marginBottom: 6, color: 'rgba(0,0,0,0.65)' }}>双模型-主答（不填则随机）</div>
+                  <AutoComplete
+                    value={apiDebateModel1}
+                    onChange={setApiDebateModel1}
+                    placeholder="例如：gpt-4o-mini"
+                    style={{ width: '100%' }}
+                    options={[...new Set([...customAvailableModels, ...availableModels])].map((m) => ({ value: m, label: m }))}
+                    filterOption={(input, option) =>
+                      (option?.value ?? '')
+                        .toString()
+                        .toLowerCase()
+                        .includes(input.toLowerCase())
+                    }
+                  />
+                </div>
+                <div>
+                  <div style={{ marginBottom: 6, color: 'rgba(0,0,0,0.65)' }}>双模型-审查（不填则随机）</div>
+                  <AutoComplete
+                    value={apiDebateModel2}
+                    onChange={setApiDebateModel2}
+                    placeholder="例如：gpt-4o"
+                    style={{ width: '100%' }}
+                    options={[...new Set([...customAvailableModels, ...availableModels])].map((m) => ({ value: m, label: m }))}
+                    filterOption={(input, option) =>
+                      (option?.value ?? '')
+                        .toString()
+                        .toLowerCase()
+                        .includes(input.toLowerCase())
+                    }
+                  />
+                </div>
+                <div>
+                  <div style={{ marginBottom: 6, color: 'rgba(0,0,0,0.65)' }}>自动路由-路由模型（不填则随机）</div>
+                  <AutoComplete
+                    value={apiRouterModel}
+                    onChange={setApiRouterModel}
+                    placeholder="例如：gpt-4o-mini"
+                    style={{ width: '100%' }}
+                    options={[...new Set([...customAvailableModels, ...availableModels])].map((m) => ({ value: m, label: m }))}
+                    filterOption={(input, option) =>
+                      (option?.value ?? '')
+                        .toString()
+                        .toLowerCase()
+                        .includes(input.toLowerCase())
+                    }
+                  />
+                </div>
+              </div>
               {customAvailableModels.length > 0 ? (
                 <div style={{ marginTop: 6, color: 'rgba(0,0,0,0.45)' }}>当前优先使用你填写的“可用模型列表”。</div>
               ) : availableModels.length > 0 ? (
                 <div style={{ marginTop: 6, color: 'rgba(0,0,0,0.45)' }}>
-                  可用模型来自服务端 `.env`（`AAS_MODEL_LIST` 或自动汇总）。
+                  可用模型来自服务端通过 API 拉取（`GET /v1/models`，会自动使用你填写的 Key/BaseURL）。`AAS_MODEL_LIST` 已弃用。
                 </div>
               ) : null}
             </div>

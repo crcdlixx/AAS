@@ -116,7 +116,7 @@ const parseRouterJson = (text: string): { subject: RouteSubject; confidence?: nu
 }
 
 const createRouterModel = (apiOverride?: ApiOverride) => {
-  const modelName = process.env.ROUTER_MODEL || 'gpt-4o-mini'
+  const modelName = apiOverride?.routerModel || process.env.ROUTER_MODEL || 'gpt-4o-mini'
   const apiKey = apiOverride?.apiKey || process.env.ROUTER_API_KEY || process.env.OPENAI_API_KEY
   const baseURL = apiOverride?.baseURL || process.env.ROUTER_BASE_URL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
 
@@ -282,6 +282,31 @@ export async function routeQuestionFromImages(
   }
 }
 
+export async function routeQuestionFromText(
+  questionText: string,
+  apiOverride?: ApiOverride
+): Promise<RouteDecision> {
+  const { model, modelName } = createRouterModel(apiOverride)
+  const q = (questionText || '').trim()
+
+  const text = `${ROUTER_PROMPT}\n\n【题目文本】\n${q}`
+  const response = await model.invoke([new HumanMessage(text)])
+  const outText = toText((response as any)?.content)
+  const parsed = parseRouterJson(outText)
+  const routerTokensUsed = extractTotalTokens(response) ?? estimateTokensFromText(text + outText)
+
+  const subject = parsed.subject
+  const mode = getSubjectMode(subject)
+
+  return {
+    subject,
+    mode,
+    confidence: parsed.confidence,
+    routerTokensUsed,
+    routerModel: modelName
+  }
+}
+
 export async function routeQuestionFromImagesWithModeOverride(
   imagePaths: string[],
   userMode: UserMode,
@@ -318,6 +343,35 @@ export async function routeQuestionFromImagesWithModeOverride(
 
   const subject = parsed.subject
   // Override mode with user's selection
+  const mode = userMode as RouteMode
+
+  return {
+    subject,
+    mode,
+    confidence: parsed.confidence,
+    routerTokensUsed,
+    routerModel: modelName
+  }
+}
+
+export async function routeQuestionFromTextWithModeOverride(
+  questionText: string,
+  userMode: UserMode,
+  apiOverride?: ApiOverride
+): Promise<RouteDecision> {
+  if (userMode === 'auto') {
+    return routeQuestionFromText(questionText, apiOverride)
+  }
+
+  const { model, modelName } = createRouterModel(apiOverride)
+  const q = (questionText || '').trim()
+  const text = `${ROUTER_PROMPT}\n\n【题目文本】\n${q}`
+  const response = await model.invoke([new HumanMessage(text)])
+  const outText = toText((response as any)?.content)
+  const parsed = parseRouterJson(outText)
+  const routerTokensUsed = extractTotalTokens(response) ?? estimateTokensFromText(text + outText)
+
+  const subject = parsed.subject
   const mode = userMode as RouteMode
 
   return {

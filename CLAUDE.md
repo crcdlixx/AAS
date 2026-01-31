@@ -150,9 +150,16 @@ X-Usage-Reset-At: 2026-01-26T10:30:00Z
 **Purpose**: Allow temporary per-request API configuration without changing `.env`
 
 **Mechanism** ([server/src/services/apiOverride.ts](server/src/services/apiOverride.ts)):
-- Client sends headers: `X-AAS-Api-Key`, `X-AAS-Base-Url`, `X-AAS-Model`
+- Client sends headers:
+  - `X-AAS-Api-Key`
+  - `X-AAS-Base-Url`
+  - `X-AAS-Model-Single`
+  - `X-AAS-Model-Debate-1`
+  - `X-AAS-Model-Debate-2`
+  - `X-AAS-Model-Router`
+  - (legacy) `X-AAS-Model`
 - Server merges with environment config (headers take precedence)
-- Applies to router model, single model, and debate models
+- Applies separately to router, single, and debate models
 
 **Priority**: Request Headers > Environment Variables > Defaults
 

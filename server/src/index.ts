@@ -7,11 +7,14 @@ import fs from 'fs'
 import { fileURLToPath } from 'url'
 import { createUsageLimiter, UsageLimitError } from './services/usageLimit.js'
 import { normalizeApiOverride, type ApiOverride } from './services/apiOverride.js'
+import { fetchModelListFromApi } from './services/modelList.js'
 import {
   solveQuestion,
   solveQuestionFromImages,
   solveQuestionStream,
   solveQuestionStreamFromImages,
+  solveQuestionFromText,
+  solveQuestionStreamFromText,
   answerFollowUp,
   type StreamUpdate
 } from './services/openai.js'
@@ -22,6 +25,7 @@ import {
   getSubjectSingleModelOverride,
   routeQuestionFromImages,
   routeQuestionFromImagesWithModeOverride,
+  routeQuestionFromTextWithModeOverride,
   type RouteDecision,
   type RouteMode,
   type RouteSubject,
@@ -31,8 +35,10 @@ import { enrichScienceAnswerWithMcp, withScienceMcpHint } from './services/scien
 import {
   solveQuestionWithDebate,
   solveQuestionWithDebateFromImages,
+  solveQuestionWithDebateFromText,
   solveQuestionWithDebateStream,
   solveQuestionWithDebateStreamFromImages,
+  solveQuestionWithDebateStreamFromText,
   answerFollowUpWithDebate
 } from './services/debate.js'
 import {
@@ -41,16 +47,25 @@ import {
   removeFile,
   clearSession,
   getSessionFiles,
-  getContentForPrompt,
+  getSessionCatalog,
+  getRagContentForPrompt,
   startCleanupTimer,
   type KnowledgeBaseFile
 } from './services/knowledgeBase.js'
+import { decideUseKnowledgeBase } from './services/knowledgeBaseDecision.js'
 import { HttpError } from './services/httpError.js'
 import { validateImageFileMagic, validatePdfFileMagic, validateTextFileLooksText } from './services/uploadValidation.js'
 import { extractPdfContent } from './services/pdfProcessor.js'
 import { extractTxtContent } from './services/txtProcessor.js'
 
 dotenv.config()
+
+if (typeof process.env.AAS_MODEL_LIST === 'string' && process.env.AAS_MODEL_LIST.trim()) {
+  console.warn(
+    '[DEPRECATED] AAS_MODEL_LIST is deprecated and will be removed in a future release. ' +
+      'The server now fetches model lists from the configured API (/v1/models).'
+  )
+}
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -114,10 +129,21 @@ const parseModelList = (value: unknown): string[] => {
     .filter(Boolean)
 }
 
-const getAvailableModelsFromEnv = (): string[] => {
-  const orderedSources: string[] = []
+const uniqueModels = (models: string[]): string[] => {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const model of models) {
+    const key = (model || '').trim()
+    if (!key) continue
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(key)
+  }
+  return out
+}
 
-  orderedSources.push(...parseModelList(process.env.AAS_MODEL_LIST))
+const getAvailableModelsFromEnvFallback = (): string[] => {
+  const orderedSources: string[] = []
 
   // Defaults
   orderedSources.push(...parseModelList(process.env.OPENAI_MODEL))
@@ -147,16 +173,31 @@ const getAvailableModelsFromEnv = (): string[] => {
   orderedSources.push(...parseModelList(process.env.ROUTE_UNKNOWN_DEBATE_MODEL1_NAME))
   orderedSources.push(...parseModelList(process.env.ROUTE_UNKNOWN_DEBATE_MODEL2_NAME))
 
-  const out: string[] = []
-  const seen = new Set<string>()
-  for (const model of orderedSources) {
-    const key = model.trim()
-    if (!key) continue
-    if (seen.has(key)) continue
-    seen.add(key)
-    out.push(key)
+  return uniqueModels(orderedSources)
+}
+
+const getAvailableModelsForRequest = async (
+  apiOverride: ApiOverride | undefined
+): Promise<{ models: string[]; source: 'api' | 'env' | 'deprecated-env' }> => {
+  const apiKey = apiOverride?.apiKey || process.env.OPENAI_API_KEY
+  const baseURL = apiOverride?.baseURL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
+  const fallback = getAvailableModelsFromEnvFallback()
+
+  if (apiKey) {
+    try {
+      const fetched = await fetchModelListFromApi({ apiKey, baseURL })
+      const merged = uniqueModels([...fetched, ...fallback])
+      if (merged.length) return { models: merged, source: 'api' }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      console.warn('Failed to fetch /v1/models; falling back to env-derived model list.', { baseURL, message })
+    }
   }
-  return out
+
+  if (fallback.length) return { models: fallback, source: 'env' }
+
+  const legacy = parseModelList(process.env.AAS_MODEL_LIST)
+  return { models: uniqueModels(legacy), source: 'deprecated-env' }
 }
 
 const usageLimiter = createUsageLimiter({
@@ -199,16 +240,34 @@ const getApiOverrideFromRequest = (req: express.Request): ApiOverride | undefine
   const apiKey = getHeader('x-aas-api-key')
   const baseURL = getHeader('x-aas-base-url')
   const model = getHeader('x-aas-model')
+  const singleModel = getHeader('x-aas-model-single')
+  const debateModel1 = getHeader('x-aas-model-debate-1')
+  const debateModel2 = getHeader('x-aas-model-debate-2')
+  const routerModel = getHeader('x-aas-model-router')
 
-  return normalizeApiOverride({ apiKey, baseURL, model })
+  return normalizeApiOverride({ apiKey, baseURL, model, singleModel, debateModel1, debateModel2, routerModel })
+}
+
+const normalizeSingleModelOverride = (apiOverride: ApiOverride | undefined): ApiOverride | undefined => {
+  if (!apiOverride) return undefined
+  const user = (apiOverride.singleModel || apiOverride.model || '').trim()
+  if (!user) return apiOverride
+  if ((apiOverride.model || '').trim() === user) return apiOverride
+  return { ...apiOverride, model: user }
 }
 
 // 中间件
 app.use(cors())
 app.use(express.json())
 
-app.get('/api/models', (_req, res) => {
-  res.json({ models: getAvailableModelsFromEnv() })
+app.get('/api/models', async (req, res, next) => {
+  try {
+    const apiOverride = getApiOverrideFromRequest(req)
+    const result = await getAvailableModelsForRequest(apiOverride)
+    res.json({ models: result.models, source: result.source })
+  } catch (e) {
+    next(e)
+  }
 })
 
 // 创建上传目录
@@ -322,6 +381,84 @@ const attachRouting = (result: any, decision: RouteDecision, userMode?: UserMode
   }
 }
 
+const buildKbRefinePrompt = (kbContent: string) => {
+  const content = (kbContent || '').trim()
+  if (!content) return ''
+  return [
+    '你将基于【参考资料】对现有解答进行校对与补充。',
+    '',
+    '要求：',
+    '- 若资料与原解答冲突，以资料为准并说明。',
+    '- 重要结论/定义/条款需要在句末用引用标注：例如 [KB:文件名#1]。',
+    '- 输出保持 Markdown；数学公式用 LaTeX（$...$ / $$...$$）。',
+    '',
+    '【参考资料】',
+    content
+  ].join('\\n')
+}
+
+const maybeGetKbForQuestion = async (
+  clientId: string,
+  question: string,
+  apiOverride?: ApiOverride,
+  onStatus?: (message: string) => void
+) => {
+  const ragEnabled = (process.env.KB_RAG_ENABLED ?? '1') !== '0'
+  if (!ragEnabled) return { kb: null as Awaited<ReturnType<typeof getRagContentForPrompt>>, decisionTokensUsed: 0 }
+
+  const catalog = getSessionCatalog(clientId)
+  if (!catalog.length) return { kb: null as Awaited<ReturnType<typeof getRagContentForPrompt>>, decisionTokensUsed: 0 }
+
+  onStatus?.('知识库：根据文件描述判断是否需要检索…')
+  let decision:
+    | Awaited<ReturnType<typeof decideUseKnowledgeBase>>
+    | { useKnowledgeBase: boolean; decisionTokensUsed: number; decisionModel: string } = {
+    useKnowledgeBase: true,
+    decisionTokensUsed: 0,
+    decisionModel: 'fallback'
+  }
+  try {
+    decision = await decideUseKnowledgeBase(question, catalog, apiOverride)
+  } catch {
+    onStatus?.('知识库：决策模型不可用，直接尝试检索…')
+  }
+  const decisionTokensUsed = typeof (decision as any).decisionTokensUsed === 'number' ? (decision as any).decisionTokensUsed : 0
+
+  if (!decision.useKnowledgeBase) {
+    onStatus?.('知识库：根据文件描述判定无需检索')
+    return { kb: null as Awaited<ReturnType<typeof getRagContentForPrompt>>, decisionTokensUsed }
+  }
+
+  onStatus?.('知识库：检索相关资料中…')
+  const kb = await getRagContentForPrompt(clientId, question, { apiOverride })
+  if (kb?.content) {
+    onStatus?.(`知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件）`)
+  } else {
+    onStatus?.('知识库：未命中相关资料')
+  }
+  return { kb, decisionTokensUsed }
+}
+
+const parseKbDescriptions = (raw: unknown): string[] | null => {
+  if (typeof raw === 'string') {
+    const text = raw.trim()
+    if (!text) return null
+    try {
+      const parsed = JSON.parse(text)
+      if (!Array.isArray(parsed)) return null
+      const out = parsed.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean)
+      return out.length ? out : null
+    } catch {
+      return null
+    }
+  }
+  if (Array.isArray(raw)) {
+    const out = raw.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean)
+    return out.length ? out : null
+  }
+  return null
+}
+
 const assertUploadOk = (result: { ok: boolean; reason?: string; code?: string }) => {
   if (result.ok) return
   throw new HttpError(400, result.reason || '上传文件校验失败', result.code || 'UPLOAD_INVALID')
@@ -349,28 +486,78 @@ app.post('/api/solve-auto', usageGuard, upload.single('image'), async (req, res)
     const decision = userSubject
       ? buildRouteDecisionFromSubject(userSubject, userMode)
       : await routeQuestionFromImagesWithModeOverride([imagePath], userMode, undefined, apiOverride)
-    const answerOverride = applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
+    const answerOverride = applyModelOverride(normalizeSingleModelOverride(apiOverride), getSubjectSingleModelOverride(decision.subject))
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
     const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
+
+    let kbInfo = { used: false, filesCount: 0, truncated: false }
 
     const result =
       decision.mode === 'debate'
         ? await solveQuestionWithDebate(imagePath, maxIterations, apiOverride, debateModelsOverride)
         : await solveQuestion(imagePath, answerOverride)
 
+    let kbRefined = result
+    if (decision.subject === 'humanities') {
+      const { kb, decisionTokensUsed } = await maybeGetKbForQuestion(clientId, result.question, apiOverride)
+      if (kb?.content) {
+        const refinePrompt = buildKbRefinePrompt(kb.content)
+        const follow =
+          decision.mode === 'debate'
+            ? await answerFollowUpWithDebate({
+                baseQuestion: result.question,
+                baseAnswer: result.answer,
+                prompt: refinePrompt,
+                maxIterations,
+                apiOverride,
+                modelsOverride: debateModelsOverride
+              })
+            : await answerFollowUp({ baseQuestion: result.question, baseAnswer: result.answer, prompt: refinePrompt, apiOverride: answerOverride })
+
+        const followTokens = typeof (follow as any)?.tokensUsed === 'number' ? (follow as any).tokensUsed : 0
+        kbRefined = {
+          ...result,
+          answer: follow.answer,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed + followTokens
+        }
+        kbInfo = { used: true, filesCount: kb.filesIncluded, truncated: false }
+      } else {
+        kbRefined = {
+          ...result,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed
+        }
+        kbRefined = {
+          ...result,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed
+        }
+        kbRefined = {
+          ...result,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed
+        }
+        kbRefined = {
+          ...result,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed
+        }
+      }
+    }
+
     const enrichedResult =
       scienceMcpEnabled
         ? await (async () => {
-            const mcp = await enrichScienceAnswerWithMcp({ question: result.question, answer: result.answer, apiOverride })
+            const mcp = await enrichScienceAnswerWithMcp({
+              question: kbRefined.question,
+              answer: kbRefined.answer,
+              apiOverride: answerOverride
+            })
             return {
-              ...result,
+              ...kbRefined,
               answer: mcp.answer,
-              tokensUsed: (result as any)?.tokensUsed ? (result as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
+              tokensUsed: (kbRefined as any)?.tokensUsed ? (kbRefined as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
             }
           })()
-        : result
+        : kbRefined
 
-    const enriched = attachRouting(enrichedResult, decision, userMode)
+    const enriched = attachRouting(enrichedResult, decision, userMode, kbInfo)
     const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
 
     fs.unlinkSync(imagePath)
@@ -406,6 +593,98 @@ app.post('/api/solve-auto', usageGuard, upload.single('image'), async (req, res)
   }
 })
 
+// API路由 - 文字题目自动路由解答（JSON）
+app.post('/api/solve-text-auto', usageGuard, async (req, res) => {
+  try {
+    const text = typeof (req.body as any)?.text === 'string' ? (req.body as any).text : ''
+    const questionText = (text || '').trim()
+    if (!questionText) {
+      return res.status(400).json({ error: '请填写题目文本' })
+    }
+
+    const clientId = (req as any).clientId as string
+    const apiOverride = getApiOverrideFromRequest(req)
+    const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
+
+    const userMode: UserMode = ['single', 'debate', 'auto'].includes((req.body as any)?.mode)
+      ? ((req.body as any).mode as UserMode)
+      : 'auto'
+
+    const userSubject = parseUserSubject((req.body as any)?.subject)
+    const decision = userSubject
+      ? buildRouteDecisionFromSubject(userSubject, userMode)
+      : await routeQuestionFromTextWithModeOverride(questionText, userMode, apiOverride)
+
+    const answerOverride = applyModelOverride(normalizeSingleModelOverride(apiOverride), getSubjectSingleModelOverride(decision.subject))
+    const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
+    const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
+
+    let kbInfo = { used: false, filesCount: 0, truncated: false }
+    const extraPrompt = scienceMcpEnabled ? withScienceMcpHint(undefined) : undefined
+
+    const result =
+      decision.mode === 'debate'
+        ? await solveQuestionWithDebateFromText(questionText, maxIterations, extraPrompt, apiOverride, debateModelsOverride)
+        : await solveQuestionFromText(questionText, extraPrompt, answerOverride)
+
+    let kbRefined = result
+    if (decision.subject === 'humanities') {
+      const { kb, decisionTokensUsed } = await maybeGetKbForQuestion(clientId, result.question, apiOverride)
+      if (kb?.content) {
+        const refinePrompt = buildKbRefinePrompt(kb.content)
+        const follow =
+          decision.mode === 'debate'
+            ? await answerFollowUpWithDebate({
+                baseQuestion: result.question,
+                baseAnswer: result.answer,
+                prompt: refinePrompt,
+                maxIterations,
+                apiOverride,
+                modelsOverride: debateModelsOverride
+              })
+            : await answerFollowUp({ baseQuestion: result.question, baseAnswer: result.answer, prompt: refinePrompt, apiOverride: answerOverride })
+
+        const followTokens = typeof (follow as any)?.tokensUsed === 'number' ? (follow as any).tokensUsed : 0
+        kbRefined = {
+          ...result,
+          answer: follow.answer,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed + followTokens
+        }
+        kbInfo = { used: true, filesCount: kb.filesIncluded, truncated: false }
+      } else {
+        kbRefined = {
+          ...result,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed
+        }
+      }
+    }
+
+    const enrichedResult =
+      scienceMcpEnabled
+        ? await (async () => {
+            const mcp = await enrichScienceAnswerWithMcp({ question: kbRefined.question, answer: kbRefined.answer, apiOverride: answerOverride })
+            return {
+              ...kbRefined,
+              answer: mcp.answer,
+              tokensUsed: (kbRefined as any)?.tokensUsed ? (kbRefined as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
+            }
+          })()
+        : kbRefined
+
+    const enriched = attachRouting(enrichedResult, decision, userMode, kbInfo)
+    const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
+
+    usageLimiter.setHeaders(res, snap)
+    res.json(enriched)
+  } catch (error) {
+    console.error('文字题目解答失败:', error instanceof Error ? error.message : error)
+    res.status(500).json({
+      error: '文字题目解答失败，请重试',
+      details: error instanceof Error ? error.message : '未知错误'
+    })
+  }
+})
+
 // API路由 - 自动路由解答（多图）
 app.post('/api/solve-multi-auto', usageGuard, upload.array('images', 20), async (req, res) => {
   const files = (req.files as Express.Multer.File[]) || []
@@ -433,29 +712,67 @@ app.post('/api/solve-multi-auto', usageGuard, upload.array('images', 20), async 
     const decision = userSubject
       ? buildRouteDecisionFromSubject(userSubject, userMode)
       : await routeQuestionFromImagesWithModeOverride(imagePaths, userMode, promptRaw, apiOverride)
-    const answerOverride = applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
+    const answerOverride = applyModelOverride(normalizeSingleModelOverride(apiOverride), getSubjectSingleModelOverride(decision.subject))
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
     const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
     const prompt = scienceMcpEnabled ? withScienceMcpHint(promptRaw) : promptRaw
+
+    let kbInfo = { used: false, filesCount: 0, truncated: false }
 
     const result =
       decision.mode === 'debate'
         ? await solveQuestionWithDebateFromImages(imagePaths, maxIterations, prompt, apiOverride, debateModelsOverride)
         : await solveQuestionFromImages(imagePaths, prompt, answerOverride)
 
+    let kbRefined = result
+    if (decision.subject === 'humanities') {
+      const { kb, decisionTokensUsed } = await maybeGetKbForQuestion(clientId, result.question, apiOverride)
+      if (kb?.content) {
+        const refinePrompt = buildKbRefinePrompt(kb.content)
+        const follow =
+          decision.mode === 'debate'
+            ? await answerFollowUpWithDebate({
+                baseQuestion: result.question,
+                baseAnswer: result.answer,
+                prompt: refinePrompt,
+                maxIterations,
+                apiOverride,
+                modelsOverride: debateModelsOverride
+              })
+            : await answerFollowUp({ baseQuestion: result.question, baseAnswer: result.answer, prompt: refinePrompt, apiOverride: answerOverride })
+
+        const followTokens = typeof (follow as any)?.tokensUsed === 'number' ? (follow as any).tokensUsed : 0
+        kbRefined = {
+          ...result,
+          answer: follow.answer,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed + followTokens
+        }
+        kbInfo = { used: true, filesCount: kb.filesIncluded, truncated: false }
+      } else {
+        kbRefined = {
+          ...result,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed
+        }
+      }
+    }
+
     const enrichedResult =
       scienceMcpEnabled
         ? await (async () => {
-            const mcp = await enrichScienceAnswerWithMcp({ question: result.question, answer: result.answer, apiOverride })
+            const mcp = await enrichScienceAnswerWithMcp({
+              question: kbRefined.question,
+              answer: kbRefined.answer,
+              apiOverride: answerOverride
+            })
             return {
-              ...result,
+              ...kbRefined,
               answer: mcp.answer,
-              tokensUsed: (result as any)?.tokensUsed ? (result as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
+              tokensUsed: (kbRefined as any)?.tokensUsed ? (kbRefined as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
             }
           })()
-        : result
+        : kbRefined
 
-    const enriched = attachRouting(enrichedResult, decision, userMode)
+    const enriched = attachRouting(enrichedResult, decision, userMode, kbInfo)
     const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
 
     cleanupUploadedFiles(files)
@@ -473,6 +790,161 @@ app.post('/api/solve-multi-auto', usageGuard, upload.array('images', 20), async 
       error: '自动路由解答失败，请重试',
       details: error instanceof Error ? error.message : '未知错误'
     })
+  }
+})
+
+// API路由 - 文字题目自动路由解答（流式）
+app.post('/api/solve-text-auto-stream', usageGuard, async (req, res) => {
+  const text = typeof (req.body as any)?.text === 'string' ? (req.body as any).text : ''
+  const questionText = (text || '').trim()
+  if (!questionText) {
+    return res.status(400).json({ error: '请填写题目文本' })
+  }
+
+  const clientId = (req as any).clientId as string
+  const apiOverride = getApiOverrideFromRequest(req)
+  const maxIterations = parseInt(process.env.MAX_DEBATE_ITERATIONS || '3')
+
+  const userMode: UserMode = ['single', 'debate', 'auto'].includes((req.body as any)?.mode)
+    ? ((req.body as any).mode as UserMode)
+    : 'auto'
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.flushHeaders()
+
+  const resAny = res as any
+  const send = (payload: unknown) => {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`)
+    if (typeof resAny.flush === 'function') resAny.flush()
+  }
+
+  const abortController = new AbortController()
+  req.on('close', () => abortController.abort())
+
+  try {
+    const userSubject = parseUserSubject((req.body as any)?.subject)
+    const decision = userSubject
+      ? buildRouteDecisionFromSubject(userSubject, userMode)
+      : await routeQuestionFromTextWithModeOverride(questionText, userMode, apiOverride)
+    const routePrefix = decision.routerModel === 'manual' ? '用户选择' : '路由结果'
+    const routeMessage = `${routePrefix}：${subjectLabel(decision.subject)} → ${modeLabel(decision.mode)}${
+      typeof decision.confidence === 'number' ? `（置信度 ${decision.confidence.toFixed(2)}）` : ''
+    }`
+
+    const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
+    const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
+    const extraPrompt = scienceMcpEnabled ? withScienceMcpHint(undefined) : undefined
+    const answerOverride = applyModelOverride(normalizeSingleModelOverride(apiOverride), getSubjectSingleModelOverride(decision.subject))
+
+    let kbInfo = { used: false, filesCount: 0, truncated: false }
+
+    const result =
+      decision.mode === 'debate'
+        ? (send({ type: 'status', message: routeMessage }),
+          await solveQuestionWithDebateStreamFromText(
+            questionText,
+            maxIterations,
+            extraPrompt,
+            (update) => send(update),
+            apiOverride,
+            debateModelsOverride,
+            abortController.signal
+          ))
+        : await solveQuestionStreamFromText(
+            questionText,
+            extraPrompt,
+            (update: StreamUpdate) => {
+              switch (update.type) {
+                case 'start':
+                  send({ type: 'start' })
+                  send({ type: 'status', message: routeMessage })
+                  break
+                case 'delta':
+                  send({ type: 'delta', value: update.value })
+                  break
+                case 'complete':
+                  send({ type: 'complete', value: update.value, result: update.result })
+                  break
+                case 'error':
+                  send({ type: 'error', message: update.message })
+                  break
+              }
+            },
+            answerOverride,
+            abortController.signal
+          )
+
+    let kbRefined = result
+    if (decision.subject === 'humanities') {
+      send({ type: 'status', message: '知识库：检索相关资料中…' })
+      const { kb, decisionTokensUsed } = await maybeGetKbForQuestion(clientId, result.question, apiOverride)
+      if (kb?.content) {
+        send({ type: 'status', message: `知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件）` })
+        const refinePrompt = buildKbRefinePrompt(kb.content)
+        const follow =
+          decision.mode === 'debate'
+            ? await answerFollowUpWithDebate({
+                baseQuestion: result.question,
+                baseAnswer: result.answer,
+                prompt: refinePrompt,
+                maxIterations,
+                apiOverride,
+                modelsOverride: debateModelsOverride,
+                signal: abortController.signal
+              })
+            : await answerFollowUp({
+                baseQuestion: result.question,
+                baseAnswer: result.answer,
+                prompt: refinePrompt,
+                apiOverride: answerOverride,
+                signal: abortController.signal
+              })
+
+        const followTokens = typeof (follow as any)?.tokensUsed === 'number' ? (follow as any).tokensUsed : 0
+        kbRefined = {
+          ...result,
+          answer: follow.answer,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed + followTokens
+        }
+        kbInfo = { used: true, filesCount: kb.filesIncluded, truncated: false }
+      } else {
+        send({ type: 'status', message: '知识库：未命中相关资料' })
+      }
+    }
+
+    const enrichedResult =
+      scienceMcpEnabled
+        ? await (async () => {
+            send({ type: 'status', message: '理科：调用 MCP 工具中…' })
+            const mcp = await enrichScienceAnswerWithMcp({ question: kbRefined.question, answer: kbRefined.answer, apiOverride: answerOverride })
+            return {
+              ...kbRefined,
+              answer: mcp.answer,
+              tokensUsed: (kbRefined as any)?.tokensUsed ? (kbRefined as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
+            }
+          })()
+        : kbRefined
+
+    const enriched = attachRouting(enrichedResult, decision, userMode, kbInfo)
+    const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
+    send({
+      type: 'final',
+      result: enriched,
+      usage: {
+        enabled: snap.enabled,
+        windowHours: snap.windowHours,
+        limitTokens: snap.limitTokens,
+        usedTokens: snap.usedTokens,
+        remainingTokens: snap.remainingTokens,
+        resetAtMs: snap.resetAtMs
+      }
+    })
+    res.end()
+  } catch (error) {
+    send({ type: 'error', message: error instanceof Error ? error.message : '未知错误' })
+    res.end()
   }
 })
 
@@ -516,6 +988,9 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
     }
   }
 
+  const abortController = new AbortController()
+  req.on('close', () => abortController.abort())
+
   try {
     const userSubject = parseUserSubject(req.body?.subject)
     const decision = userSubject
@@ -527,27 +1002,10 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
     }`
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
     const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
+    const answerOverride = applyModelOverride(normalizeSingleModelOverride(apiOverride), getSubjectSingleModelOverride(decision.subject))
 
-    // Check for knowledge base content
-    let enhancedPrompt: string | undefined
     let kbInfo = { used: false, filesCount: 0, truncated: false }
-
-    if (decision.subject === 'humanities') {
-      const kbContent = getContentForPrompt(clientId)
-      if (kbContent) {
-        enhancedPrompt = `【参考资料】\n以下是用户提供的知识库内容，请在解答时参考这些资料：\n\n${kbContent.content}\n\n请基于上述参考资料和题目图片，给出详细解答。`
-        kbInfo = { used: true, filesCount: kbContent.filesIncluded, truncated: kbContent.truncated }
-        console.log('[KB] Content injected:', {
-          clientId,
-          subject: 'humanities',
-          filesCount: kbContent.filesIncluded,
-          truncated: kbContent.truncated
-        })
-        if (kbContent.truncated) {
-          send({ type: 'status', message: `知识库内容已截断（仅使用最近 ${kbContent.filesIncluded} 个文件）` })
-        }
-      }
-    }
+    const extraPrompt = scienceMcpEnabled ? withScienceMcpHint(undefined) : undefined
 
     const result =
       decision.mode === 'debate'
@@ -555,14 +1013,15 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
           await solveQuestionWithDebateStreamFromImages(
             [imagePath],
             maxIterations,
-            enhancedPrompt,
+            extraPrompt,
             (update) => send(update),
             apiOverride,
-            debateModelsOverride
+            debateModelsOverride,
+            abortController.signal
           ))
         : await solveQuestionStreamFromImages(
             [imagePath],
-            enhancedPrompt,
+            extraPrompt,
             (update: StreamUpdate) => {
               switch (update.type) {
                 case 'start':
@@ -580,21 +1039,64 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
                   break
               }
             },
-            applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
+            answerOverride,
+            abortController.signal
           )
+
+    let kbRefined = result
+    if (decision.subject === 'humanities') {
+      send({ type: 'status', message: '知识库：检索相关资料中…' })
+      const { kb, decisionTokensUsed } = await maybeGetKbForQuestion(clientId, result.question, apiOverride)
+      if (kb?.content) {
+        send({ type: 'status', message: `知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件）` })
+        const refinePrompt = buildKbRefinePrompt(kb.content)
+        const follow =
+          decision.mode === 'debate'
+            ? await answerFollowUpWithDebate({
+                baseQuestion: result.question,
+                baseAnswer: result.answer,
+                prompt: refinePrompt,
+                maxIterations,
+                apiOverride,
+                modelsOverride: debateModelsOverride,
+                signal: abortController.signal
+              })
+            : await answerFollowUp({
+                baseQuestion: result.question,
+                baseAnswer: result.answer,
+                prompt: refinePrompt,
+                apiOverride: answerOverride,
+                signal: abortController.signal
+              })
+
+        const followTokens = typeof (follow as any)?.tokensUsed === 'number' ? (follow as any).tokensUsed : 0
+        kbRefined = {
+          ...result,
+          answer: follow.answer,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed + followTokens
+        }
+        kbInfo = { used: true, filesCount: kb.filesIncluded, truncated: false }
+      } else {
+        send({ type: 'status', message: '知识库：未命中相关资料' })
+      }
+    }
 
     const enrichedResult =
       scienceMcpEnabled
         ? await (async () => {
             send({ type: 'status', message: '理科：调用 MCP 工具中...' })
-            const mcp = await enrichScienceAnswerWithMcp({ question: result.question, answer: result.answer, apiOverride })
+            const mcp = await enrichScienceAnswerWithMcp({
+              question: kbRefined.question,
+              answer: kbRefined.answer,
+              apiOverride: answerOverride
+            })
             return {
-              ...result,
+              ...kbRefined,
               answer: mcp.answer,
-              tokensUsed: (result as any)?.tokensUsed ? (result as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
+              tokensUsed: (kbRefined as any)?.tokensUsed ? (kbRefined as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
             }
           })()
-        : result
+        : kbRefined
 
     const enriched = attachRouting(enrichedResult, decision, userMode, kbInfo)
     const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
@@ -666,6 +1168,9 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
     }
   }
 
+  const abortController = new AbortController()
+  req.on('close', () => abortController.abort())
+
   try {
     const userSubject = parseUserSubject(req.body?.subject)
     const decision = userSubject
@@ -677,30 +1182,10 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
     }`
     const debateModelsOverride = getSubjectDebateModelsOverride(decision.subject)
     const scienceMcpEnabled = decision.subject === 'science' && process.env.MCP_PYTHON_ENABLED !== '0'
+    const answerOverride = applyModelOverride(normalizeSingleModelOverride(apiOverride), getSubjectSingleModelOverride(decision.subject))
 
-    // Check for knowledge base content
     let kbInfo = { used: false, filesCount: 0, truncated: false }
-    let finalPrompt = promptRaw
-
-    if (decision.subject === 'humanities') {
-      const kbContent = getContentForPrompt(clientId)
-      if (kbContent) {
-        const kbPrompt = `【参考资料】\n以下是用户提供的知识库内容，请在解答时参考这些资料：\n\n${kbContent.content}\n\n请基于上述参考资料和题目图片，给出详细解答。`
-        finalPrompt = promptRaw ? `${kbPrompt}\n\n${promptRaw}` : kbPrompt
-        kbInfo = { used: true, filesCount: kbContent.filesIncluded, truncated: kbContent.truncated }
-        console.log('[KB] Content injected:', {
-          clientId,
-          subject: 'humanities',
-          filesCount: kbContent.filesIncluded,
-          truncated: kbContent.truncated
-        })
-        if (kbContent.truncated) {
-          send({ type: 'status', message: `知识库内容已截断（仅使用最近 ${kbContent.filesIncluded} 个文件）` })
-        }
-      }
-    }
-
-    const prompt = scienceMcpEnabled ? withScienceMcpHint(finalPrompt) : finalPrompt
+    const prompt = scienceMcpEnabled ? withScienceMcpHint(promptRaw) : promptRaw
 
     const result =
       decision.mode === 'debate'
@@ -711,7 +1196,8 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
             prompt,
             (update) => send(update),
             apiOverride,
-            debateModelsOverride
+            debateModelsOverride,
+            abortController.signal
           ))
         : await solveQuestionStreamFromImages(
             imagePaths,
@@ -733,21 +1219,64 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
                   break
               }
             },
-            applyModelOverride(apiOverride, getSubjectSingleModelOverride(decision.subject))
+            answerOverride,
+            abortController.signal
           )
+
+    let kbRefined = result
+    if (decision.subject === 'humanities') {
+      send({ type: 'status', message: '知识库：检索相关资料中…' })
+      const { kb, decisionTokensUsed } = await maybeGetKbForQuestion(clientId, result.question, apiOverride)
+      if (kb?.content) {
+        send({ type: 'status', message: `知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件）` })
+        const refinePrompt = buildKbRefinePrompt(kb.content)
+        const follow =
+          decision.mode === 'debate'
+            ? await answerFollowUpWithDebate({
+                baseQuestion: result.question,
+                baseAnswer: result.answer,
+                prompt: refinePrompt,
+                maxIterations,
+                apiOverride,
+                modelsOverride: debateModelsOverride,
+                signal: abortController.signal
+              })
+            : await answerFollowUp({
+                baseQuestion: result.question,
+                baseAnswer: result.answer,
+                prompt: refinePrompt,
+                apiOverride: answerOverride,
+                signal: abortController.signal
+              })
+
+        const followTokens = typeof (follow as any)?.tokensUsed === 'number' ? (follow as any).tokensUsed : 0
+        kbRefined = {
+          ...result,
+          answer: follow.answer,
+          tokensUsed: (typeof result.tokensUsed === 'number' ? result.tokensUsed : 0) + decisionTokensUsed + followTokens
+        }
+        kbInfo = { used: true, filesCount: kb.filesIncluded, truncated: false }
+      } else {
+        send({ type: 'status', message: '知识库：未命中相关资料' })
+      }
+    }
 
     const enrichedResult =
       scienceMcpEnabled
         ? await (async () => {
             send({ type: 'status', message: '理科：调用 MCP 工具中...' })
-            const mcp = await enrichScienceAnswerWithMcp({ question: result.question, answer: result.answer, apiOverride })
+            const mcp = await enrichScienceAnswerWithMcp({
+              question: kbRefined.question,
+              answer: kbRefined.answer,
+              apiOverride: answerOverride
+            })
             return {
-              ...result,
+              ...kbRefined,
               answer: mcp.answer,
-              tokensUsed: (result as any)?.tokensUsed ? (result as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
+              tokensUsed: (kbRefined as any)?.tokensUsed ? (kbRefined as any).tokensUsed + mcp.mcpTokensUsed : mcp.mcpTokensUsed
             }
           })()
-        : result
+        : kbRefined
 
     const enriched = attachRouting(enrichedResult, decision, userMode, kbInfo)
     const snap = usageLimiter.addUsage(clientId, (enriched as any)?.tokensUsed ?? 0)
@@ -782,6 +1311,12 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
       return res.status(400).json({ error: '请上传文件' })
     }
 
+    const descriptions = parseKbDescriptions((req.body as any)?.descriptions)
+    if (!descriptions || descriptions.length !== files.length) {
+      cleanupUploadedFiles(files)
+      return res.status(400).json({ error: '请为每个文件提供文件描述' })
+    }
+
     assertCanAddFiles(
       clientId,
       files.map((f) => ({ sizeBytes: f.size, originalName: f.originalname }))
@@ -789,7 +1324,8 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
 
     const processedFiles = []
 
-    for (const file of files) {
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]
       try {
         const fileType = path.extname(file.originalname).toLowerCase() === '.pdf' ? 'pdf' : 'txt'
         if (fileType === 'pdf') {
@@ -808,9 +1344,15 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
           content = await extractTxtContent(file.path)
         }
 
+        const description = (descriptions[i] || '').trim()
+        if (!description) {
+          throw new HttpError(400, '请为每个文件提供文件描述', 'KB_DESCRIPTION_REQUIRED')
+        }
+
         const kbFile: KnowledgeBaseFile = {
           id: createId(),
           originalName: file.originalname,
+          description,
           type: fileType,
           content,
           extractionMethod,
@@ -822,6 +1364,7 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
         processedFiles.push({
           id: kbFile.id,
           originalName: kbFile.originalName,
+          description: kbFile.description,
           type: kbFile.type,
           extractionMethod: kbFile.extractionMethod,
           sizeBytes: kbFile.sizeBytes,
@@ -883,6 +1426,7 @@ app.get('/api/knowledge-base/list', usageGuard, (req, res) => {
     files: files.map((f) => ({
       id: f.id,
       originalName: f.originalName,
+      description: f.description,
       type: f.type,
       extractionMethod: f.extractionMethod,
       sizeBytes: f.sizeBytes,
@@ -937,23 +1481,41 @@ app.post('/api/follow-up', usageGuard, async (req, res) => {
 
     const clientId = (req as any).clientId as string
     const apiOverride = getApiOverrideFromRequest(req)
+    const baseApiOverride = normalizeSingleModelOverride(apiOverride)
+    const followUpApiOverride =
+      mode === 'single' && routedSubject ? applyModelOverride(baseApiOverride, getSubjectSingleModelOverride(routedSubject)) : baseApiOverride
+
+    let finalPrompt = prompt
+    let kbDecisionTokensUsed = 0
+    if (routedSubject === 'humanities') {
+      const { kb, decisionTokensUsed } = await maybeGetKbForQuestion(clientId, `${baseQuestion}\n${prompt}`, apiOverride)
+      kbDecisionTokensUsed = decisionTokensUsed
+      if (kb?.content) {
+        finalPrompt = `${buildKbRefinePrompt(kb.content)}\n\n---\n\n用户追问：\n${prompt}`
+      }
+    }
 
     const result =
       mode === 'debate'
         ? await answerFollowUpWithDebate({
             baseQuestion,
             baseAnswer,
-            prompt,
+            prompt: finalPrompt,
             messages,
             maxIterations: parseInt(process.env.MAX_DEBATE_ITERATIONS || '3', 10),
             apiOverride,
             modelsOverride: routedSubject ? getSubjectDebateModelsOverride(routedSubject) : undefined
           })
-        : await answerFollowUp({ baseQuestion, baseAnswer, prompt, messages, apiOverride })
+        : await answerFollowUp({ baseQuestion, baseAnswer, prompt: finalPrompt, messages, apiOverride: followUpApiOverride })
 
-    const snap = usageLimiter.addUsage(clientId, (result as any)?.tokensUsed ?? 0)
+    const withKbDecisionTokens = {
+      ...(result as any),
+      tokensUsed: ((result as any)?.tokensUsed ?? 0) + kbDecisionTokensUsed
+    }
+
+    const snap = usageLimiter.addUsage(clientId, (withKbDecisionTokens as any)?.tokensUsed ?? 0)
     usageLimiter.setHeaders(res, snap)
-    res.json(result)
+    res.json(withKbDecisionTokens)
   } catch (error) {
     console.error('追问失败:', error instanceof Error ? error.message : error)
     res.status(500).json({

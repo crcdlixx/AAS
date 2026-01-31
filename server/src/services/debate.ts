@@ -40,12 +40,16 @@ const createModels = (apiOverride?: ApiOverride, modelsOverride?: DebateModelsOv
   const overrideKey = apiOverride?.apiKey
   const overrideBase = apiOverride?.baseURL
   const overrideModel = apiOverride?.model
+  const overrideModel1 = apiOverride?.debateModel1
+  const overrideModel2 = apiOverride?.debateModel2
 
   const model1Override = modelsOverride?.model1
   const model2Override = modelsOverride?.model2
 
-  const model1Name = clean(overrideModel) || clean(model1Override?.modelName) || process.env.MODEL1_NAME || 'gpt-4o-mini'
-  const model2Name = clean(overrideModel) || clean(model2Override?.modelName) || process.env.MODEL2_NAME || 'gpt-4o'
+  const model1Name =
+    clean(overrideModel1) || clean(overrideModel) || clean(model1Override?.modelName) || process.env.MODEL1_NAME || 'gpt-4o-mini'
+  const model2Name =
+    clean(overrideModel2) || clean(overrideModel) || clean(model2Override?.modelName) || process.env.MODEL2_NAME || 'gpt-4o'
 
   const model1 = new ChatOpenAI({
     modelName: model1Name,
@@ -112,7 +116,7 @@ const formatHistory = (history: FollowUpChatMessage[]) =>
     .map((m) => `${m.role === 'user' ? '用户' : '助手'}：${m.content}`)
     .join('\n')
 
-async function followUpModel1Propose(state: FollowUpState, models: DebateModels): Promise<FollowUpState> {
+async function followUpModel1Propose(state: FollowUpState, models: DebateModels, signal?: AbortSignal): Promise<FollowUpState> {
   const { iteration, baseQuestion, baseAnswer, history, prompt, model1_answer, model2_review } = state
   const historyText = formatHistory(history)
 
@@ -125,14 +129,14 @@ async function followUpModel1Propose(state: FollowUpState, models: DebateModels)
           historyText ? `\n\n历史对话：\n${historyText}\n` : '\n'
         }\n你上一轮的回答：\n${model1_answer}\n\n审查意见：\n${model2_review}\n\n请根据审查意见改进你的回答；如认为无需修改，请简要说明理由并给出更清晰的最终回答。`
 
-  const response = await models.model1.invoke([new HumanMessage(text)])
+  const response = await (models.model1 as any).invoke([new HumanMessage(text)], { signal })
   const answer = (response.content as string) || ''
   state.tokens_used += extractTotalTokens(response) ?? estimateTokensFromText(answer)
   state.model1_answer = answer
   return state
 }
 
-async function followUpModel2Review(state: FollowUpState, models: DebateModels): Promise<FollowUpState> {
+async function followUpModel2Review(state: FollowUpState, models: DebateModels, signal?: AbortSignal): Promise<FollowUpState> {
   const { baseQuestion, baseAnswer, history, prompt, model1_answer } = state
   const historyText = formatHistory(history)
 
@@ -140,7 +144,7 @@ async function followUpModel2Review(state: FollowUpState, models: DebateModels):
     historyText ? `\n\n历史对话：\n${historyText}\n` : '\n'
   }\n用户追问：\n${prompt}\n\n助手回答：\n${model1_answer}\n\n如果回答已经很好，请回复：\nAPPROVED: <一句话说明为什么好>\n\n如果需要改进，请指出具体问题与改进建议。`
 
-  const response = await models.model2.invoke([new HumanMessage(reviewPrompt)])
+  const response = await (models.model2 as any).invoke([new HumanMessage(reviewPrompt)], { signal })
   const review = (response.content as string) || ''
   state.tokens_used += extractTotalTokens(response) ?? estimateTokensFromText(review)
 
@@ -161,6 +165,7 @@ export async function answerFollowUpWithDebate(opts: {
   messages?: unknown
   apiOverride?: ApiOverride
   modelsOverride?: DebateModelsOverride
+  signal?: AbortSignal
 }): Promise<FollowUpResult> {
   const baseQuestion = (opts.baseQuestion || '').trim()
   const baseAnswer = (opts.baseAnswer || '').trim()
@@ -188,8 +193,9 @@ export async function answerFollowUpWithDebate(opts: {
   }
 
   while (state.iteration < state.max_iterations && !state.consensus_reached) {
-    state = await followUpModel1Propose(state, models)
-    state = await followUpModel2Review(state, models)
+    if (opts.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    state = await followUpModel1Propose(state, models, opts.signal)
+    state = await followUpModel2Review(state, models, opts.signal)
   }
 
   const answer = (state.final_answer || state.model1_answer || '').trim()
@@ -203,19 +209,21 @@ export async function answerFollowUpWithDebate(opts: {
   }
 }
 
-async function model1Propose(state: DebateState, models: DebateModels, onUpdate?: DebateUpdateHandler): Promise<DebateState> {
+async function model1Propose(state: DebateState, models: DebateModels, onUpdate?: DebateUpdateHandler, signal?: AbortSignal): Promise<DebateState> {
   const { iteration, images, extraPrompt, model1_answer, model2_review } = state
 
   let content: any[]
 
   if (iteration === 0) {
-    // 第一次回答
+    const isTextOnly = !images?.length
     content = [
       {
         type: 'text',
-        text: `请识别图片中的题目（可能包含多张图片/多个裁剪区域，属于同一道题的不同部分），并合并理解后给出详细的解答步骤。请用中文回答。格式如下：\n\n题目：[识别出的题目内容]\n\n解答：[详细的解答步骤]${
-          extraPrompt ? `\n\n补充说明：\n${extraPrompt}` : ''
-        }`
+        text: isTextOnly
+          ? `请根据用户提供的【题目文本】直接解答。\n\n输出要求：\n- 使用 Markdown。\n- 数学/物理/化学等公式请用 LaTeX（行内 $...$；独立公式 $$...$$）。\n- 解答里必须包含清晰的“最终答案”（可直接复制），并给出推导/步骤。\n\n格式如下（请保留“题目/解答”标签，便于系统解析）：\n\n题目：\n[题目内容]\n\n解答：\n[详细的解答步骤，包含最终答案与必要公式]${
+              extraPrompt ? `\n\n补充说明：\n${extraPrompt}` : ''
+            }\n\n【题目文本】\n${state.question}`
+          : `请识别图片中的题目（可能包含多张图片/多个裁剪区域，属于同一道题的不同部分），并合并理解后给出解答。\n\n输出要求：\n- 使用 Markdown。\n- 数学/物理/化学等公式请用 LaTeX（行内 $...$；独立公式 $$...$$）。\n- 解答里必须包含清晰的“最终答案”（可直接复制），并给出推导/步骤。\n\n格式如下（请保留“题目/解答”标签，便于系统解析）：\n\n题目：\n[识别出的题目内容]\n\n解答：\n[详细的解答步骤，包含最终答案与必要公式]${extraPrompt ? `\n\n补充说明：\n${extraPrompt}` : ''}`
       }
     ]
 
@@ -247,7 +255,7 @@ ${model2_review}
     ]
   }
 
-  const response = await models.model1.invoke([new HumanMessage({ content })])
+  const response = await (models.model1 as any).invoke([new HumanMessage({ content })], { signal })
   const answer = response.content as string
   state.tokens_used += extractTotalTokens(response) ?? estimateTokensFromText(answer)
 
@@ -263,10 +271,13 @@ ${model2_review}
   return state
 }
 
-async function model2Review(state: DebateState, models: DebateModels, onUpdate?: DebateUpdateHandler): Promise<DebateState> {
-  const { question, model1_answer, iteration } = state
+async function model2Review(state: DebateState, models: DebateModels, onUpdate?: DebateUpdateHandler, signal?: AbortSignal): Promise<DebateState> {
+  const { question, model1_answer, iteration, images } = state
+  const isTextOnly = !images?.length
 
-  const prompt = `原始任务：识别并解答图片中的题目
+  const prompt = isTextOnly
+    ? `原始任务：根据题目文本解答\n\n题目文本：\n${question}\n\n待审查的答案：\n${model1_answer}\n\n请仔细审查这个答案，评估其：\n1. 是否正确理解题意\n2. 解答的完整性和正确性\n3. 逻辑性和清晰度\n4. 是否有遗漏或错误\n\n如果答案已经很好，请回复\"APPROVED: [简短说明为什么这个答案很好]\"\n如果需要改进，请提供具体的改进建议。`
+    : `原始任务：识别并解答图片中的题目
 
 待审查的答案：
 ${model1_answer}
@@ -280,7 +291,7 @@ ${model1_answer}
 如果答案已经很好，请回复"APPROVED: [简短说明为什么这个答案很好]"
 如果需要改进，请提供具体的改进建议。`
 
-  const response = await models.model2.invoke([new HumanMessage(prompt)])
+  const response = await (models.model2 as any).invoke([new HumanMessage(prompt)], { signal })
   const review = response.content as string
   state.tokens_used += extractTotalTokens(response) ?? estimateTokensFromText(review)
 
@@ -318,7 +329,8 @@ export async function solveQuestionWithDebateFromImages(
   maxIterations: number = 3,
   extraPrompt?: string,
   apiOverride?: ApiOverride,
-  modelsOverride?: DebateModelsOverride
+  modelsOverride?: DebateModelsOverride,
+  signal?: AbortSignal
 ) {
   try {
     console.log(`\n${'='.repeat(60)}`)
@@ -347,11 +359,12 @@ export async function solveQuestionWithDebateFromImages(
 
     // 博弈循环
     while (state.iteration < maxIterations && !state.consensus_reached) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
       // 模型1提出或改进答案
-      state = await model1Propose(state, models)
+      state = await model1Propose(state, models, undefined, signal)
       
       // 模型2审查
-      state = await model2Review(state, models)
+      state = await model2Review(state, models, undefined, signal)
     }
 
     console.log(`\n${'='.repeat(60)}`)
@@ -380,6 +393,53 @@ export async function solveQuestionWithDebateFromImages(
   }
 }
 
+export async function solveQuestionWithDebateFromText(
+  questionText: string,
+  maxIterations: number = 3,
+  extraPrompt?: string,
+  apiOverride?: ApiOverride,
+  modelsOverride?: DebateModelsOverride,
+  signal?: AbortSignal
+) {
+  try {
+    const q = (questionText || '').trim()
+    if (!q) throw new Error('question text is empty')
+
+    const models = createModels(apiOverride, modelsOverride)
+    let state: DebateState = {
+      question: q,
+      images: undefined,
+      extraPrompt,
+      model1_answer: '',
+      model2_review: '',
+      iteration: 0,
+      max_iterations: maxIterations,
+      consensus_reached: false,
+      final_answer: '',
+      tokens_used: 0
+    }
+
+    while (state.iteration < maxIterations && !state.consensus_reached) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+      state = await model1Propose(state, models, undefined, signal)
+      state = await model2Review(state, models, undefined, signal)
+    }
+
+    const answer = state.final_answer || state.model1_answer
+    const answerMatch = answer.match(/解答[：:]\s*([\s\S]+)/)
+    return {
+      question: q,
+      answer: answerMatch ? answerMatch[1].trim() : answer,
+      iterations: state.iteration,
+      consensus: state.consensus_reached,
+      tokensUsed: state.tokens_used
+    }
+  } catch (error) {
+    console.error('多模型辩论失败:', error instanceof Error ? error.message : error)
+    throw new Error('多模型辩论失败，请检查配置')
+  }
+}
+
 export async function solveQuestionWithDebateStream(
   imagePath: string,
   maxIterations: number = 3,
@@ -390,13 +450,64 @@ export async function solveQuestionWithDebateStream(
   return solveQuestionWithDebateStreamFromImages([imagePath], maxIterations, undefined, onUpdate, apiOverride, modelsOverride)
 }
 
+export async function solveQuestionWithDebateStreamFromText(
+  questionText: string,
+  maxIterations: number = 3,
+  extraPrompt?: string,
+  onUpdate?: DebateUpdateHandler,
+  apiOverride?: ApiOverride,
+  modelsOverride?: DebateModelsOverride,
+  signal?: AbortSignal
+) {
+  try {
+    const q = (questionText || '').trim()
+    if (!q) throw new Error('question text is empty')
+
+    const models = createModels(apiOverride, modelsOverride)
+    let state: DebateState = {
+      question: q,
+      images: undefined,
+      extraPrompt,
+      model1_answer: '',
+      model2_review: '',
+      iteration: 0,
+      max_iterations: maxIterations,
+      consensus_reached: false,
+      final_answer: '',
+      tokens_used: 0
+    }
+
+    while (state.iteration < maxIterations && !state.consensus_reached) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+      onUpdate?.({ type: 'status', message: '模型1 生成答案中...', iteration: state.iteration + 1 })
+      state = await model1Propose(state, models, onUpdate, signal)
+      onUpdate?.({ type: 'status', message: '模型2 审查中...', iteration: state.iteration + 1 })
+      state = await model2Review(state, models, onUpdate, signal)
+    }
+
+    const answer = state.final_answer || state.model1_answer
+    const answerMatch = answer.match(/解答[：:]\s*([\s\S]+)/)
+    return {
+      question: q,
+      answer: answerMatch ? answerMatch[1].trim() : answer,
+      iterations: state.iteration,
+      consensus: state.consensus_reached,
+      tokensUsed: state.tokens_used
+    }
+  } catch (error) {
+    console.error('多模型辩论失败:', error instanceof Error ? error.message : error)
+    throw new Error('多模型辩论失败，请检查配置')
+  }
+}
+
 export async function solveQuestionWithDebateStreamFromImages(
   imagePaths: string[],
   maxIterations: number = 3,
   extraPrompt?: string,
   onUpdate?: DebateUpdateHandler,
   apiOverride?: ApiOverride,
-  modelsOverride?: DebateModelsOverride
+  modelsOverride?: DebateModelsOverride,
+  signal?: AbortSignal
 ) {
   try {
     console.log(`\n${'='.repeat(60)}`)
@@ -424,15 +535,16 @@ export async function solveQuestionWithDebateStreamFromImages(
     }
 
     while (state.iteration < maxIterations && !state.consensus_reached) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
       if (onUpdate) {
         onUpdate({ type: 'status', message: '模型1 生成答案中...', iteration: state.iteration + 1 })
       }
-      state = await model1Propose(state, models, onUpdate)
+      state = await model1Propose(state, models, onUpdate, signal)
 
       if (onUpdate) {
         onUpdate({ type: 'status', message: '模型2 审查中...', iteration: state.iteration + 1 })
       }
-      state = await model2Review(state, models, onUpdate)
+      state = await model2Review(state, models, onUpdate, signal)
     }
 
     console.log(`\n${'='.repeat(60)}`)

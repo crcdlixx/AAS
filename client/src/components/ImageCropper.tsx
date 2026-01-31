@@ -30,8 +30,19 @@ function ImageCropper({ imageUrl, onCropComplete }: ImageCropperProps) {
 
     if (!ctx) return
 
-    canvas.width = completedCrop.width
-    canvas.height = completedCrop.height
+    const srcW = Math.max(1, Math.round(completedCrop.width * scaleX))
+    const srcH = Math.max(1, Math.round(completedCrop.height * scaleY))
+    const maxSide = 3000
+    const downScale = Math.min(1, maxSide / Math.max(srcW, srcH))
+
+    canvas.width = Math.max(1, Math.round(srcW * downScale))
+    canvas.height = Math.max(1, Math.round(srcH * downScale))
+    ctx.imageSmoothingEnabled = true
+    try {
+      ;(ctx as any).imageSmoothingQuality = 'high'
+    } catch {
+      // ignore
+    }
 
     ctx.drawImage(
       image,
@@ -41,8 +52,8 @@ function ImageCropper({ imageUrl, onCropComplete }: ImageCropperProps) {
       completedCrop.height * scaleY,
       0,
       0,
-      completedCrop.width,
-      completedCrop.height
+      canvas.width,
+      canvas.height
     )
 
     return new Promise<Blob>((resolve) => {

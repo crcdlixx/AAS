@@ -27,8 +27,42 @@ export type StreamUpdate =
   | { type: 'complete'; value: string; result: SolveResult }
   | { type: 'error'; message: string }
 
-const PROMPT =
-  '请识别图片中的题目（可能包含多张图片/多个裁剪区域，属于同一道题的不同部分），并合并理解后给出详细的解答步骤。请用中文回答。格式如下：\n\n题目：[识别出的题目内容]\n\n解答：[详细的解答步骤]'
+const MULTIPLE_CHOICE_HINT = `选择题注意：
+- 若题目为选择题，请判断是单选/多选/不定项选择。
+- 若为多选/不定项，最终答案必须给出所有正确选项（如 ACD），不要只给一个。
+- 若题型不明确，请说明不确定性并给出最可能的选项组合。`
+
+const PROMPT_BASE = `请识别图片中的题目（可能包含多张图片/多个裁剪区域，属于同一道题的不同部分），并合并理解后给出解答。
+
+输出要求：
+- 使用 Markdown。
+- 数学/物理/化学等公式请用 LaTeX（行内 $...$；独立公式 $$...$$）。
+- 解答里必须包含清晰的“最终答案”（可直接复制），并给出推导/步骤。
+
+格式如下（请保留“题目/解答”标签，便于系统解析）：
+
+题目：
+[识别出的题目内容]
+
+解答：
+[详细的解答步骤，包含最终答案与必要公式]`
+
+const PROMPT = PROMPT_BASE + '\n\n' + MULTIPLE_CHOICE_HINT
+
+const TEXT_PROMPT_BASE = `请根据用户提供的【题目文本】直接解答。
+输出要求：
+- 使用 Markdown。
+- 数学/物理/化学等公式请用 LaTeX（行内 $...$；独立公式 $$...$$）。
+- 解答里必须包含清晰的“最终答案”（可直接复制），并给出推导/步骤。
+格式如下（请保留“题目/解答”标签，便于系统解析）：
+
+题目：[题目内容]
+
+解答：[详细解答步骤，包含最终答案与必要公式]`
+
+const TEXT_PROMPT = TEXT_PROMPT_BASE + '\n\n' + MULTIPLE_CHOICE_HINT
+
+export const __TESTING__ = { PROMPT, TEXT_PROMPT, MULTIPLE_CHOICE_HINT }
 
 const toText = (content: any): string => {
   if (!content) return ''
@@ -105,6 +139,12 @@ const buildMessages = (images: EncodedImage[], extraPrompt?: string) => {
   return [new HumanMessage({ content })]
 }
 
+const buildTextMessages = (questionText: string, extraPrompt?: string) => {
+  const q = (questionText || '').trim()
+  const prompt = extraPrompt ? `${TEXT_PROMPT}\n\n补充说明：\n${extraPrompt}` : TEXT_PROMPT
+  return [new HumanMessage(`${prompt}\n\n【题目文本】\n${q}`)]
+}
+
 const encodeImage = (imagePath: string): EncodedImage => {
   const imageBuffer = fs.readFileSync(imagePath)
   return { base64Image: imageBuffer.toString('base64'), mimeType: getMimeType(imagePath) }
@@ -117,8 +157,10 @@ const getDeltaFromStreamChunk = (chunk: any): string => {
   if (typeof chunk === 'string') return chunk
   if (typeof chunk.text === 'string') return chunk.text
   if (typeof chunk.content === 'string') return chunk.content
+  if (chunk.content) return toText(chunk.content)
   if (typeof chunk.message?.content === 'string') return chunk.message.content
   if (chunk.message?.content) return toText(chunk.message.content)
+  if (chunk.delta?.content) return toText(chunk.delta.content)
   return ''
 }
 
@@ -133,55 +175,97 @@ const getEndOutputText = (output: any): { text: string; finishReason?: string } 
   return { text, finishReason }
 }
 
+export type ConsumedLangChainStream = {
+  content: string
+  finishReason?: string
+  tokensUsed?: number
+  deltaCount: number
+  observedEvents: string[]
+}
+
+export async function consumeLangChainEventStream(
+  stream: AsyncIterable<any>,
+  opts?: {
+    onDelta?: (delta: string) => void
+    signal?: AbortSignal
+    extractTokensUsed?: (output: any) => number | undefined
+  }
+): Promise<ConsumedLangChainStream> {
+  let content = ''
+  let finishReason: string | undefined
+  let endEventText = ''
+  let tokensUsed: number | undefined
+  let deltaCount = 0
+  const observedEvents = new Set<string>()
+
+  for await (const event of stream) {
+    if (opts?.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    const eventName =
+      typeof event?.event === 'string'
+        ? event.event
+        : typeof event?.name === 'string'
+          ? event.name
+          : typeof event?.type === 'string'
+            ? event.type
+            : ''
+    observedEvents.add(eventName || 'unknown')
+
+    // LangChain event names/shapes have varied across versions; prefer resilient extraction.
+    const deltaSource = event?.data?.chunk ?? event?.data?.delta ?? event?.data?.token ?? event?.data?.text
+    const delta = getDeltaFromStreamChunk(deltaSource)
+    if (delta) {
+      content += delta
+      opts?.onDelta?.(delta)
+      deltaCount += 1
+    }
+
+    const endOutput = event?.data?.output ?? event?.data?.response ?? event?.data?.result
+    if (endOutput) {
+      const { text, finishReason: reason } = getEndOutputText(endOutput)
+      if (text && text.length > endEventText.length) {
+        endEventText = text
+      }
+      if (reason) finishReason = reason
+      if (tokensUsed === undefined && opts?.extractTokensUsed) {
+        tokensUsed = opts.extractTokensUsed(endOutput)
+      }
+    }
+  }
+
+  if (endEventText && endEventText.length > content.length) {
+    content = endEventText
+  }
+
+  return { content, finishReason, tokensUsed, deltaCount, observedEvents: Array.from(observedEvents) }
+}
+
 export async function solveQuestionStream(
   imagePath: string,
   onUpdate?: (update: StreamUpdate) => void,
-  apiOverride?: ApiOverride
+  apiOverride?: ApiOverride,
+  signal?: AbortSignal
 ): Promise<SolveResult> {
-  return solveQuestionStreamFromImages([imagePath], undefined, onUpdate, apiOverride)
+  return solveQuestionStreamFromImages([imagePath], undefined, onUpdate, apiOverride, signal)
 }
 
 export async function solveQuestionStreamFromImages(
   imagePaths: string[],
   extraPrompt?: string,
   onUpdate?: (update: StreamUpdate) => void,
-  apiOverride?: ApiOverride
+  apiOverride?: ApiOverride,
+  signal?: AbortSignal
 ): Promise<SolveResult> {
   try {
     const images = encodeImages(imagePaths)
     const model = createModel(true, apiOverride)
-    const stream = await model.streamEvents(buildMessages(images, extraPrompt), { version: 'v1' })
+    const stream = await (model as any).streamEvents(buildMessages(images, extraPrompt), { version: 'v1', signal })
 
     onUpdate?.({ type: 'start' })
-    let content = ''
-    let finishReason: string | undefined
-    let endEventText = ''
-    let tokensUsed: number | undefined
-    let deltaCount = 0
-
-    for await (const event of stream) {
-      if (event.event === 'on_chat_model_stream') {
-        const delta = getDeltaFromStreamChunk(event.data?.chunk)
-        if (delta) {
-          content += delta
-          onUpdate?.({ type: 'delta', value: delta })
-          deltaCount += 1
-        }
-      }
-
-      if (event.event === 'on_chat_model_end') {
-        const { text, finishReason: reason } = getEndOutputText(event.data?.output)
-        if (text && text.length > endEventText.length) {
-          endEventText = text
-        }
-        if (reason) finishReason = reason
-        tokensUsed = tokensUsed ?? extractTotalTokens(event.data?.output)
-      }
-    }
-
-    if (endEventText && endEventText.length > content.length) {
-      content = endEventText
-    }
+    const { content, finishReason, tokensUsed, deltaCount, observedEvents } = await consumeLangChainEventStream(stream, {
+      signal,
+      onDelta: (delta) => onUpdate?.({ type: 'delta', value: delta }),
+      extractTokensUsed: extractTotalTokens
+    })
 
     const parsed = buildSolveResult(content)
     const looksIncomplete =
@@ -194,9 +278,10 @@ export async function solveQuestionStreamFromImages(
       console.warn('流式输出为空或被截断，触发回退调用', {
         finishReason,
         deltaCount,
-        contentLength: content.length
+        contentLength: content.length,
+        observedEvents: observedEvents.slice(0, 40)
       })
-      const fallback = await solveQuestionFromImages(imagePaths, extraPrompt, apiOverride)
+      const fallback = await solveQuestionFromImages(imagePaths, extraPrompt, apiOverride, signal)
       const fallbackText = `题目：${fallback.question}\n\n解答：${fallback.answer}`
       onUpdate?.({ type: 'complete', value: fallbackText, result: fallback })
       return fallback
@@ -232,12 +317,13 @@ export async function solveQuestion(imagePath: string, apiOverride?: ApiOverride
 export async function solveQuestionFromImages(
   imagePaths: string[],
   extraPrompt?: string,
-  apiOverride?: ApiOverride
+  apiOverride?: ApiOverride,
+  signal?: AbortSignal
 ): Promise<SolveResult> {
   try {
     const images = encodeImages(imagePaths)
     const model = createModel(false, apiOverride)
-    const response = await model.invoke(buildMessages(images, extraPrompt))
+    const response = await (model as any).invoke(buildMessages(images, extraPrompt), { signal })
     const content = toText(response.content) || '无法识别题目'
 
     const parsed = buildSolveResult(content)
@@ -252,12 +338,95 @@ export async function solveQuestionFromImages(
   }
 }
 
+export async function solveQuestionFromText(
+  questionText: string,
+  extraPrompt?: string,
+  apiOverride?: ApiOverride,
+  signal?: AbortSignal
+): Promise<SolveResult> {
+  try {
+    const q = (questionText || '').trim()
+    if (!q) throw new Error('question text is empty')
+
+    const model = createModel(false, apiOverride)
+    const response = await (model as any).invoke(buildTextMessages(q, extraPrompt), { signal })
+    const content = toText(response.content) || '无法解答'
+
+    const parsed = buildSolveResult(content)
+    const tokensUsed =
+      extractTotalTokens(response) ??
+      estimateTokensFromText(TEXT_PROMPT + (extraPrompt ? `\n${extraPrompt}` : '')) + estimateTokensFromText(content)
+
+    return { question: q, answer: parsed.answer || content, tokensUsed }
+  } catch (error) {
+    console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
+    throw new Error('AI解答失败，请检查 API 配置')
+  }
+}
+
+export async function solveQuestionStreamFromText(
+  questionText: string,
+  extraPrompt?: string,
+  onUpdate?: (update: StreamUpdate) => void,
+  apiOverride?: ApiOverride,
+  signal?: AbortSignal
+): Promise<SolveResult> {
+  try {
+    const q = (questionText || '').trim()
+    if (!q) throw new Error('question text is empty')
+
+    const model = createModel(true, apiOverride)
+    const stream = await (model as any).streamEvents(buildTextMessages(q, extraPrompt), { version: 'v1', signal })
+
+    onUpdate?.({ type: 'start' })
+    const { content, finishReason, tokensUsed, deltaCount, observedEvents } = await consumeLangChainEventStream(stream, {
+      signal,
+      onDelta: (delta) => onUpdate?.({ type: 'delta', value: delta }),
+      extractTokensUsed: extractTotalTokens
+    })
+
+    const parsed = buildSolveResult(content)
+    const looksIncomplete = !content.trim() || finishReason === 'length' || !parsed.answer?.trim()
+
+    if (looksIncomplete) {
+      console.warn('stream output empty/truncated; falling back', {
+        finishReason,
+        deltaCount,
+        contentLength: content.length,
+        observedEvents: observedEvents.slice(0, 40)
+      })
+      const fallback = await solveQuestionFromText(q, extraPrompt, apiOverride, signal)
+      const fallbackText = `题目：${fallback.question}\n\n解答：${fallback.answer}`
+      onUpdate?.({ type: 'complete', value: fallbackText, result: fallback })
+      return fallback
+    }
+
+    const result: SolveResult = {
+      question: q,
+      answer: parsed.answer || content,
+      tokensUsed:
+        tokensUsed ??
+        estimateTokensFromText(TEXT_PROMPT + (extraPrompt ? `\n${extraPrompt}` : '')) + estimateTokensFromText(content)
+    }
+    onUpdate?.({ type: 'complete', value: content, result })
+    return result
+  } catch (error) {
+    console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
+    onUpdate?.({
+      type: 'error',
+      message: error instanceof Error ? error.message : 'AI解答失败，请检查 API 配置'
+    })
+    throw new Error('AI解答失败，请检查 API 配置')
+  }
+}
+
 export async function answerFollowUp(opts: {
   baseQuestion: string
   baseAnswer: string
   prompt: string
   messages?: unknown
   apiOverride?: ApiOverride
+  signal?: AbortSignal
 }): Promise<FollowUpResult> {
   const baseQuestion = (opts.baseQuestion || '').trim()
   const baseAnswer = (opts.baseAnswer || '').trim()
@@ -271,7 +440,7 @@ export async function answerFollowUp(opts: {
 
   const lcMessages: (SystemMessage | HumanMessage | AIMessage)[] = [
     new SystemMessage(
-      '你是一个严谨、友好的中文学习助手。你将基于题目与已有解答，回答用户的后续追问；必要时可纠错并给出更清晰的推导步骤。'
+      '你是一个严谨、友好的中文学习助手。你将基于题目与已有解答，回答用户的后续追问；必要时可纠错并给出更清晰的推导步骤。请使用 Markdown；公式用 LaTeX（$...$ / $$...$$）。'
     ),
     new HumanMessage(`题目：\n${baseQuestion}\n\n已给出的解答：\n${baseAnswer}`)
   ]
@@ -282,7 +451,7 @@ export async function answerFollowUp(opts: {
 
   lcMessages.push(new HumanMessage(`用户追问：\n${prompt}`))
 
-  const response = await model.invoke(lcMessages)
+  const response = await (model as any).invoke(lcMessages, { signal: opts.signal })
   const answer = (toText((response as any)?.content) || '').trim()
   const tokensUsed =
     extractTotalTokens(response) ??

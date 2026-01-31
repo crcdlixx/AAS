@@ -45,8 +45,24 @@ const cropToBlob = async (img: HTMLImageElement, pixelCrop: PixelCrop) => {
   const ctx = canvas.getContext('2d')
   if (!ctx) return null
 
-  canvas.width = Math.max(1, Math.round(pixelCrop.width))
-  canvas.height = Math.max(1, Math.round(pixelCrop.height))
+  // Export at (close to) the original image resolution; otherwise small text becomes unreadable.
+  const srcW = Math.max(1, Math.round(pixelCrop.width * scaleX))
+  const srcH = Math.max(1, Math.round(pixelCrop.height * scaleY))
+
+  // Avoid generating extremely large images (which increases upload size and vision token usage).
+  const maxSide = 3000
+  const downScale = Math.min(1, maxSide / Math.max(srcW, srcH))
+  const outW = Math.max(1, Math.round(srcW * downScale))
+  const outH = Math.max(1, Math.round(srcH * downScale))
+
+  canvas.width = outW
+  canvas.height = outH
+  ctx.imageSmoothingEnabled = true
+  try {
+    ;(ctx as any).imageSmoothingQuality = 'high'
+  } catch {
+    // ignore
+  }
 
   ctx.drawImage(
     img,
@@ -56,8 +72,8 @@ const cropToBlob = async (img: HTMLImageElement, pixelCrop: PixelCrop) => {
     pixelCrop.height * scaleY,
     0,
     0,
-    pixelCrop.width,
-    pixelCrop.height
+    outW,
+    outH
   )
 
   return await new Promise<Blob | null>((resolve) => {
