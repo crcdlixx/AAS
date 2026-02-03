@@ -304,12 +304,12 @@ export const solveQuestionStream = async (
     }
   }
 
-  const processBuffer = () => {
-    let splitIndex = buffer.indexOf('\n\n')
+  const processBuffer = (ref: { value: string }) => {
+    let splitIndex = ref.value.indexOf('\n\n')
     while (splitIndex !== -1) {
-      const chunk = buffer.slice(0, splitIndex)
-      buffer = buffer.slice(splitIndex + 2)
-      splitIndex = buffer.indexOf('\n\n')
+      const chunk = ref.value.slice(0, splitIndex)
+      ref.value = ref.value.slice(splitIndex + 2)
+      splitIndex = ref.value.indexOf('\n\n')
       processChunk(chunk)
     }
   }
@@ -317,15 +317,15 @@ export const solveQuestionStream = async (
   while (true) {
     const { value, done } = await reader.read()
     if (done) break
-    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
-    processBuffer()
+    bufferRef.value += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
+    processBuffer(bufferRef)
   }
 
-  buffer += decoder.decode().replace(/\r\n/g, '\n')
-  processBuffer()
+  bufferRef.value += decoder.decode().replace(/\r\n/g, '\n')
+  processBuffer(bufferRef)
 
-  if (buffer.trim()) {
-    processChunk(buffer)
+  if (bufferRef.value.trim()) {
+    processChunk(bufferRef.value)
   }
 
   if (!finalResult && lastCompleteResult) {
@@ -436,12 +436,12 @@ export const solveQuestionMultiStream = async (
     }
   }
 
-  const processBuffer = () => {
-    let splitIndex = buffer.indexOf('\n\n')
+  const processBuffer = (ref: { value: string }) => {
+    let splitIndex = ref.value.indexOf('\n\n')
     while (splitIndex !== -1) {
-      const chunk = buffer.slice(0, splitIndex)
-      buffer = buffer.slice(splitIndex + 2)
-      splitIndex = buffer.indexOf('\n\n')
+      const chunk = ref.value.slice(0, splitIndex)
+      ref.value = ref.value.slice(splitIndex + 2)
+      splitIndex = ref.value.indexOf('\n\n')
       processChunk(chunk)
     }
   }
@@ -449,15 +449,15 @@ export const solveQuestionMultiStream = async (
   while (true) {
     const { value, done } = await reader.read()
     if (done) break
-    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
-    processBuffer()
+    bufferRef.value += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
+    processBuffer(bufferRef)
   }
 
-  buffer += decoder.decode().replace(/\r\n/g, '\n')
-  processBuffer()
+  bufferRef.value += decoder.decode().replace(/\r\n/g, '\n')
+  processBuffer(bufferRef)
 
-  if (buffer.trim()) {
-    processChunk(buffer)
+  if (bufferRef.value.trim()) {
+    processChunk(bufferRef.value)
   }
 
   if (!finalResult && lastCompleteResult) {
