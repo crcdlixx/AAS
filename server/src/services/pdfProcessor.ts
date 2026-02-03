@@ -2,6 +2,7 @@ import fs from 'fs'
 import { ChatOpenAI } from '@langchain/openai'
 import { HumanMessage } from '@langchain/core/messages'
 import dotenv from 'dotenv'
+import type { ApiOverride } from './apiOverride.js'
 
 dotenv.config()
 
@@ -36,7 +37,7 @@ async function extractTextFromPdf(filePath: string): Promise<string> {
   }
 }
 
-async function extractPdfViaImages(filePath: string): Promise<string> {
+async function extractPdfViaImages(filePath: string, apiOverride?: ApiOverride): Promise<string> {
   try {
     console.log('[PDF] Starting image fallback for:', filePath)
 
@@ -52,11 +53,11 @@ async function extractPdfViaImages(filePath: string): Promise<string> {
 
     // Use vision model to extract text from each page
     const model = new ChatOpenAI({
-      modelName: process.env.ROUTER_MODEL || 'gpt-4o-mini',
+      modelName: apiOverride?.routerModel || process.env.ROUTER_MODEL || 'gpt-4o-mini',
       temperature: 0,
-      openAIApiKey: process.env.ROUTER_API_KEY || process.env.OPENAI_API_KEY,
+      openAIApiKey: apiOverride?.apiKey || process.env.ROUTER_API_KEY || process.env.OPENAI_API_KEY,
       configuration: {
-        baseURL: process.env.ROUTER_BASE_URL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
+        baseURL: apiOverride?.baseURL || process.env.ROUTER_BASE_URL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
       }
     })
 
@@ -101,7 +102,8 @@ async function extractPdfViaImages(filePath: string): Promise<string> {
 }
 
 export async function extractPdfContent(
-  filePath: string
+  filePath: string,
+  apiOverride?: ApiOverride
 ): Promise<{
   content: string
   method: 'text' | 'image-fallback'
@@ -118,7 +120,7 @@ export async function extractPdfContent(
   console.log('[PDF] Text extraction insufficient, trying image fallback')
 
   // Stage 2: Fallback to image conversion
-  const imageContent = await extractPdfViaImages(filePath)
+  const imageContent = await extractPdfViaImages(filePath, apiOverride)
 
   return { content: imageContent, method: 'image-fallback' }
 }

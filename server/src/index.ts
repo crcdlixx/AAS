@@ -7,7 +7,7 @@ import fs from 'fs'
 import { fileURLToPath } from 'url'
 import { createUsageLimiter, UsageLimitError } from './services/usageLimit.js'
 import { normalizeApiOverride, type ApiOverride } from './services/apiOverride.js'
-import { fetchModelListFromApi } from './services/modelList.js'
+import { fetchModelListsFromApi } from './services/modelList.js'
 import {
   solveQuestion,
   solveQuestionFromImages,
@@ -49,6 +49,7 @@ import {
   getSessionFiles,
   getSessionCatalog,
   getRagContentForPrompt,
+  precomputeFileEmbeddings,
   startCleanupTimer,
   type KnowledgeBaseFile
 } from './services/knowledgeBase.js'
@@ -176,28 +177,59 @@ const getAvailableModelsFromEnvFallback = (): string[] => {
   return uniqueModels(orderedSources)
 }
 
+const getAvailableEmbeddingModelsFromEnvFallback = (): string[] => {
+  const orderedSources: string[] = []
+  if (typeof process.env.KB_EMBEDDING_MODEL === 'string') {
+    orderedSources.push(...parseModelList(process.env.KB_EMBEDDING_MODEL))
+  }
+  return uniqueModels(orderedSources)
+}
+
 const getAvailableModelsForRequest = async (
   apiOverride: ApiOverride | undefined
-): Promise<{ models: string[]; source: 'api' | 'env' | 'deprecated-env' }> => {
+): Promise<{
+  models: string[]
+  embeddingModels: string[]
+  allModels: string[]
+  source: 'api' | 'env' | 'deprecated-env'
+}> => {
   const apiKey = apiOverride?.apiKey || process.env.OPENAI_API_KEY
   const baseURL = apiOverride?.baseURL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
-  const fallback = getAvailableModelsFromEnvFallback()
+  const chatFallback = getAvailableModelsFromEnvFallback()
+  const embeddingFallback = getAvailableEmbeddingModelsFromEnvFallback()
 
   if (apiKey) {
     try {
-      const fetched = await fetchModelListFromApi({ apiKey, baseURL })
-      const merged = uniqueModels([...fetched, ...fallback])
-      if (merged.length) return { models: merged, source: 'api' }
+      const fetched = await fetchModelListsFromApi({ apiKey, baseURL })
+      const chatMerged = uniqueModels([...fetched.chatModels, ...chatFallback])
+      const embeddingMerged = uniqueModels([...fetched.embeddingModels, ...embeddingFallback])
+      const allMerged = uniqueModels([...fetched.allModels, ...chatFallback, ...embeddingFallback])
+      if (chatMerged.length || embeddingMerged.length || allMerged.length) {
+        return {
+          models: chatMerged,
+          embeddingModels: embeddingMerged,
+          allModels: allMerged,
+          source: 'api'
+        }
+      }
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
       console.warn('Failed to fetch /v1/models; falling back to env-derived model list.', { baseURL, message })
     }
   }
 
-  if (fallback.length) return { models: fallback, source: 'env' }
+  if (chatFallback.length || embeddingFallback.length) {
+    return {
+      models: chatFallback,
+      embeddingModels: embeddingFallback,
+      allModels: uniqueModels([...chatFallback, ...embeddingFallback]),
+      source: 'env'
+    }
+  }
 
   const legacy = parseModelList(process.env.AAS_MODEL_LIST)
-  return { models: uniqueModels(legacy), source: 'deprecated-env' }
+  const legacyUnique = uniqueModels(legacy)
+  return { models: legacyUnique, embeddingModels: [], allModels: legacyUnique, source: 'deprecated-env' }
 }
 
 const usageLimiter = createUsageLimiter({
@@ -244,8 +276,9 @@ const getApiOverrideFromRequest = (req: express.Request): ApiOverride | undefine
   const debateModel1 = getHeader('x-aas-model-debate-1')
   const debateModel2 = getHeader('x-aas-model-debate-2')
   const routerModel = getHeader('x-aas-model-router')
+  const embeddingModel = getHeader('x-aas-model-embedding')
 
-  return normalizeApiOverride({ apiKey, baseURL, model, singleModel, debateModel1, debateModel2, routerModel })
+  return normalizeApiOverride({ apiKey, baseURL, model, singleModel, debateModel1, debateModel2, routerModel, embeddingModel })
 }
 
 const normalizeSingleModelOverride = (apiOverride: ApiOverride | undefined): ApiOverride | undefined => {
@@ -264,7 +297,12 @@ app.get('/api/models', async (req, res, next) => {
   try {
     const apiOverride = getApiOverrideFromRequest(req)
     const result = await getAvailableModelsForRequest(apiOverride)
-    res.json({ models: result.models, source: result.source })
+    res.json({
+      models: result.models,
+      embeddingModels: result.embeddingModels,
+      allModels: result.allModels,
+      source: result.source
+    })
   } catch (e) {
     next(e)
   }
@@ -354,6 +392,34 @@ const createId = () =>
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`
 
+const isAbortError = (error: unknown): boolean => {
+  if (!error) return false
+  const anyErr = error as any
+  if (typeof anyErr?.name === 'string' && anyErr.name === 'AbortError') return true
+  const msg = typeof anyErr?.message === 'string' ? anyErr.message : ''
+  return msg === 'Aborted' || msg === 'The operation was aborted.'
+}
+
+const containsCjk = (text: string): boolean => /[\u3400-\u4DBF\u4E00-\u9FFF]/.test(text)
+
+const fixUploadedOriginalName = (name: string): string => {
+  const raw = typeof name === 'string' ? name : ''
+  if (!raw) return raw
+
+  // Heuristic for common mojibake like "ä¸­æ–‡.pdf" where UTF-8 bytes were decoded as latin1.
+  if (!/[\u00C0-\u00FF]/.test(raw)) return raw
+
+  try {
+    const decoded = Buffer.from(raw, 'latin1').toString('utf8')
+    if (!decoded || decoded === raw) return raw
+    if (decoded.includes('\uFFFD')) return raw
+    if (containsCjk(decoded)) return decoded
+    return raw
+  } catch {
+    return raw
+  }
+}
+
 const parseUserSubject = (raw: unknown): RouteSubject | undefined => {
   const v = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
   if (v === 'science' || v === 'humanities' || v === 'unknown') return v as RouteSubject
@@ -432,7 +498,9 @@ const maybeGetKbForQuestion = async (
   onStatus?.('知识库：检索相关资料中…')
   const kb = await getRagContentForPrompt(clientId, question, { apiOverride })
   if (kb?.content) {
-    onStatus?.(`知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件）`)
+    onStatus?.(
+      `知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件，${kb.usedEmbeddings ? '向量检索' : '关键词检索'}）`
+    )
   } else {
     onStatus?.('知识库：未命中相关资料')
   }
@@ -881,7 +949,10 @@ app.post('/api/solve-text-auto-stream', usageGuard, async (req, res) => {
       send({ type: 'status', message: '知识库：检索相关资料中…' })
       const { kb, decisionTokensUsed } = await maybeGetKbForQuestion(clientId, result.question, apiOverride)
       if (kb?.content) {
-        send({ type: 'status', message: `知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件）` })
+        send({
+          type: 'status',
+          message: `知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件，${kb.usedEmbeddings ? '向量检索' : '关键词检索'}）`
+        })
         const refinePrompt = buildKbRefinePrompt(kb.content)
         const follow =
           decision.mode === 'debate'
@@ -943,6 +1014,10 @@ app.post('/api/solve-text-auto-stream', usageGuard, async (req, res) => {
     })
     res.end()
   } catch (error) {
+    if (abortController.signal.aborted || isAbortError(error)) {
+      res.end()
+      return
+    }
     send({ type: 'error', message: error instanceof Error ? error.message : '未知错误' })
     res.end()
   }
@@ -1048,7 +1123,10 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
       send({ type: 'status', message: '知识库：检索相关资料中…' })
       const { kb, decisionTokensUsed } = await maybeGetKbForQuestion(clientId, result.question, apiOverride)
       if (kb?.content) {
-        send({ type: 'status', message: `知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件）` })
+        send({
+          type: 'status',
+          message: `知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件，${kb.usedEmbeddings ? '向量检索' : '关键词检索'}）`
+        })
         const refinePrompt = buildKbRefinePrompt(kb.content)
         const follow =
           decision.mode === 'debate'
@@ -1114,6 +1192,10 @@ app.post('/api/solve-auto-stream', usageGuard, upload.single('image'), async (re
     })
     res.end()
   } catch (error) {
+    if (abortController.signal.aborted || isAbortError(error)) {
+      res.end()
+      return
+    }
     send({ type: 'error', message: error instanceof Error ? error.message : '未知错误' })
     res.end()
   } finally {
@@ -1228,7 +1310,10 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
       send({ type: 'status', message: '知识库：检索相关资料中…' })
       const { kb, decisionTokensUsed } = await maybeGetKbForQuestion(clientId, result.question, apiOverride)
       if (kb?.content) {
-        send({ type: 'status', message: `知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件）` })
+        send({
+          type: 'status',
+          message: `知识库：已命中 ${kb.chunksIncluded} 段（${kb.filesIncluded} 个文件，${kb.usedEmbeddings ? '向量检索' : '关键词检索'}）`
+        })
         const refinePrompt = buildKbRefinePrompt(kb.content)
         const follow =
           decision.mode === 'debate'
@@ -1294,6 +1379,10 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
     })
     res.end()
   } catch (error) {
+    if (abortController.signal.aborted || isAbortError(error)) {
+      res.end()
+      return
+    }
     send({ type: 'error', message: error instanceof Error ? error.message : '未知错误' })
     res.end()
   } finally {
@@ -1305,6 +1394,7 @@ app.post('/api/solve-multi-auto-stream', usageGuard, upload.array('images', 20),
 app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), async (req, res) => {
   const files = (req.files as Express.Multer.File[]) || []
   const clientId = (req as any).clientId as string
+  const apiOverride = getApiOverrideFromRequest(req)
 
   try {
     if (!files.length) {
@@ -1319,15 +1409,16 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
 
     assertCanAddFiles(
       clientId,
-      files.map((f) => ({ sizeBytes: f.size, originalName: f.originalname }))
+      files.map((f) => ({ sizeBytes: f.size, originalName: fixUploadedOriginalName(f.originalname) }))
     )
 
     const processedFiles = []
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i]
+      const originalName = fixUploadedOriginalName(file.originalname)
       try {
-        const fileType = path.extname(file.originalname).toLowerCase() === '.pdf' ? 'pdf' : 'txt'
+        const fileType = path.extname(originalName).toLowerCase() === '.pdf' ? 'pdf' : 'txt'
         if (fileType === 'pdf') {
           assertUploadOk(validatePdfFileMagic(file.path))
         } else {
@@ -1337,7 +1428,7 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
         let extractionMethod: 'text' | 'image-fallback' = 'text'
 
         if (fileType === 'pdf') {
-          const result = await extractPdfContent(file.path)
+          const result = await extractPdfContent(file.path, apiOverride)
           content = result.content
           extractionMethod = result.method
         } else {
@@ -1351,7 +1442,7 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
 
         const kbFile: KnowledgeBaseFile = {
           id: createId(),
-          originalName: file.originalname,
+          originalName,
           description,
           type: fileType,
           content,
@@ -1361,6 +1452,10 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
         }
 
         addFile(clientId, kbFile)
+        void precomputeFileEmbeddings(kbFile, apiOverride).catch((e) => {
+          const message = e instanceof Error ? e.message : String(e)
+          console.warn('[KB] Embedding precompute failed:', { clientId, fileName: kbFile.originalName, message })
+        })
         processedFiles.push({
           id: kbFile.id,
           originalName: kbFile.originalName,
@@ -1373,15 +1468,15 @@ app.post('/api/knowledge-base/upload', usageGuard, kbUpload.array('files', 10), 
 
         console.log('[KB] File uploaded:', {
           clientId,
-          fileName: file.originalname,
+          fileName: originalName,
           type: fileType,
           size: file.size,
           extractionMethod
         })
       } catch (error) {
-        console.error('[KB] File processing failed:', file.originalname, error)
+        console.error('[KB] File processing failed:', originalName, error)
         processedFiles.push({
-          originalName: file.originalname,
+          originalName,
           error: error instanceof Error ? error.message : '处理失败',
           ...(error instanceof HttpError ? { code: error.code } : {})
         } as any)
@@ -1597,8 +1692,8 @@ export const startServer = async (opts?: { port?: number | string }) => {
           ? (address as any).port
           : requestedPort
 
-      console.log(`馃殌 鏈嶅姟鍣ㄨ繍琛屽湪 http://localhost:${port}`)
-      console.log(`馃摑 API绔偣: http://localhost:${port}/api`)
+      console.log(`🚀 服务器运行在 http://localhost:${port}`)
+      console.log(`📝 API端点: http://localhost:${port}/api`)
 
       if (process.env.AAS_PRINT_PORT === '1') {
         console.log(`AAS_PORT=${port}`)

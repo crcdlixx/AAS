@@ -2,6 +2,7 @@ import { estimateTokensFromText } from './tokenUsage.js'
 import { HttpError } from './httpError.js'
 import OpenAI from 'openai'
 import { randomUUID } from 'crypto'
+import { fetchModelListsFromApi } from './modelList.js'
 
 export type KnowledgeBaseSession = {
   clientId: string
@@ -60,7 +61,34 @@ const getKbChunkTokens = (): number => toPositiveInt(process.env.KB_CHUNK_TOKENS
 const getKbChunkOverlapTokens = (): number => toPositiveInt(process.env.KB_CHUNK_OVERLAP_TOKENS) ?? DEFAULT_CHUNK_OVERLAP_TOKENS
 const getKbTopK = (): number => toPositiveInt(process.env.KB_TOP_K) ?? DEFAULT_TOP_K
 const getKbRagEnabled = (): boolean => (process.env.KB_RAG_ENABLED ?? '1') !== '0'
-const getKbEmbeddingModel = (): string => (process.env.KB_EMBEDDING_MODEL || 'text-embedding-3-small').trim()
+const getKbEmbedOnUploadEnabled = (): boolean => (process.env.KB_EMBED_ON_UPLOAD ?? '1') !== '0'
+const DEFAULT_KB_EMBEDDING_MODEL = 'text-embedding-3-small'
+const getKbEmbeddingModelFromEnv = (): string | null => {
+  const raw = typeof process.env.KB_EMBEDDING_MODEL === 'string' ? process.env.KB_EMBEDDING_MODEL.trim() : ''
+  return raw ? raw : null
+}
+
+const resolveKbEmbeddingModel = async (apiOverride?: ApiOverrideForKb): Promise<string> => {
+  const override = typeof apiOverride?.embeddingModel === 'string' ? apiOverride.embeddingModel.trim() : ''
+  if (override) return override
+
+  const envModel = getKbEmbeddingModelFromEnv()
+  if (envModel) return envModel
+
+  const apiKey = apiOverride?.apiKey || process.env.OPENAI_API_KEY
+  const baseURL = apiOverride?.baseURL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
+
+  if (apiKey) {
+    try {
+      const lists = await fetchModelListsFromApi({ apiKey, baseURL })
+      if (lists.embeddingModels.length) return lists.embeddingModels[0]
+    } catch {
+      // ignore; fall back to default
+    }
+  }
+
+  return DEFAULT_KB_EMBEDDING_MODEL
+}
 const getKbEmbeddingBatchSize = (): number => Math.min(256, Math.max(1, toPositiveInt(process.env.KB_EMBEDDING_BATCH_SIZE) ?? 64))
 
 export function addFile(clientId: string, file: KnowledgeBaseFile): void {
@@ -172,7 +200,7 @@ export function getContentForPrompt(
   }
 }
 
-type ApiOverrideForKb = { apiKey?: string; baseURL?: string }
+type ApiOverrideForKb = { apiKey?: string; baseURL?: string; embeddingModel?: string }
 
 const createOpenAIClient = (apiOverride?: ApiOverrideForKb) => {
   const apiKey = apiOverride?.apiKey || process.env.OPENAI_API_KEY
@@ -227,7 +255,7 @@ const ensureChunkEmbeddings = async (chunks: KnowledgeBaseChunk[], apiOverride?:
   if (!missing.length) return
 
   const client = createOpenAIClient(apiOverride)
-  const model = getKbEmbeddingModel()
+  const model = await resolveKbEmbeddingModel(apiOverride)
   const batchSize = getKbEmbeddingBatchSize()
 
   for (let i = 0; i < missing.length; i += batchSize) {
@@ -237,6 +265,15 @@ const ensureChunkEmbeddings = async (chunks: KnowledgeBaseChunk[], apiOverride?:
       batch[j].embedding = embeddings[j]
     }
   }
+}
+
+export async function precomputeFileEmbeddings(file: KnowledgeBaseFile, apiOverride?: ApiOverrideForKb): Promise<void> {
+  if (!getKbRagEnabled()) return
+  if (!getKbEmbedOnUploadEnabled()) return
+  if (!(apiOverride?.apiKey || process.env.OPENAI_API_KEY)) return
+  const chunks = file.chunks || []
+  if (!chunks.length) return
+  await ensureChunkEmbeddings(chunks, apiOverride)
 }
 
 export async function getRagContentForPrompt(
@@ -272,7 +309,8 @@ export async function getRagContentForPrompt(
   try {
     await ensureChunkEmbeddings(allChunks, opts?.apiOverride)
     const client = createOpenAIClient(opts?.apiOverride)
-    const embeddings = await embedBatch(client, getKbEmbeddingModel(), [q])
+    const model = await resolveKbEmbeddingModel(opts?.apiOverride)
+    const embeddings = await embedBatch(client, model, [q])
     queryEmbedding = embeddings[0]
     usedEmbeddings = true
   } catch {

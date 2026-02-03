@@ -3,13 +3,15 @@ import { Upload, Button, List, Tag, Space, message, Collapse, Input } from 'antd
 import { UploadOutlined, DeleteOutlined, FileTextOutlined, FilePdfOutlined } from '@ant-design/icons'
 import type { UploadFile } from 'antd'
 import { uploadFiles, listFiles, removeFile, clearAll, type KnowledgeBaseFile } from '../services/knowledgeBaseApi'
+import type { ApiConfig } from '../services/api'
 
 type Props = {
   files: KnowledgeBaseFile[]
   onFilesChange: (files: KnowledgeBaseFile[]) => void
+  apiConfig?: ApiConfig
 }
 
-export default function KnowledgeBasePanel({ files, onFilesChange }: Props) {
+export default function KnowledgeBasePanel({ files, onFilesChange, apiConfig }: Props) {
   const [uploading, setUploading] = useState(false)
   const [fileList, setFileList] = useState<UploadFile[]>([])
   const [fileDescriptions, setFileDescriptions] = useState<Record<string, string>>({})
@@ -29,7 +31,7 @@ export default function KnowledgeBasePanel({ files, onFilesChange }: Props) {
         return
       }
 
-      const response = await uploadFiles(filesToUpload, descriptions)
+      const response = await uploadFiles(filesToUpload, descriptions, apiConfig)
 
       const successCount = response.files.filter((f) => !f.error).length
       const errorCount = response.files.filter((f) => f.error).length
@@ -42,7 +44,7 @@ export default function KnowledgeBasePanel({ files, onFilesChange }: Props) {
       }
 
       // Refresh file list
-      const updated = await listFiles()
+      const updated = await listFiles(apiConfig)
       onFilesChange(updated.files)
       setFileList([])
       setFileDescriptions({})
@@ -55,9 +57,9 @@ export default function KnowledgeBasePanel({ files, onFilesChange }: Props) {
 
   const handleRemove = async (fileId: string) => {
     try {
-      await removeFile(fileId)
+      await removeFile(fileId, apiConfig)
       message.success('文件已删除')
-      const updated = await listFiles()
+      const updated = await listFiles(apiConfig)
       onFilesChange(updated.files)
     } catch (error) {
       message.error('删除失败')
@@ -66,7 +68,7 @@ export default function KnowledgeBasePanel({ files, onFilesChange }: Props) {
 
   const handleClearAll = async () => {
     try {
-      await clearAll()
+      await clearAll(apiConfig)
       message.success('已清空知识库')
       onFilesChange([])
     } catch (error) {

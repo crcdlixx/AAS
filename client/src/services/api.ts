@@ -2,10 +2,16 @@ import axios from 'axios'
 import { getFingerprintId } from '../utils/fingerprint'
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api'
+const parseTimeoutMs = (raw: string | undefined, fallback: number) => {
+  if (!raw) return fallback
+  const value = Number(raw)
+  return Number.isFinite(value) && value > 0 ? value : fallback
+}
+const API_TIMEOUT_MS = parseTimeoutMs(import.meta.env.VITE_API_TIMEOUT_MS, 120000)
 
 const api = axios.create({
   baseURL: API_BASE,
-  timeout: 120000, // 增加超时时间以支持多模型博弈
+  timeout: API_TIMEOUT_MS, // 增加超时时间以支持多模型博弈
 })
 
 api.interceptors.request.use(async (config) => {
@@ -54,12 +60,30 @@ export type ApiConfig = {
   debateModel1?: string
   debateModel2?: string
   routerModel?: string
+  embeddingModel?: string
   modelCandidates?: string[]
 }
 
+export type AvailableModelsResponse = {
+  models: string[]
+  embeddingModels?: string[]
+  allModels?: string[]
+  source?: 'api' | 'env' | 'deprecated-env'
+}
+
 export const getAvailableModels = async (apiConfig?: ApiConfig): Promise<string[]> => {
-  const response = await api.get<{ models: string[] }>('/models', { headers: buildApiOverrideHeaders(apiConfig) })
+  const response = await api.get<AvailableModelsResponse>('/models', { headers: buildApiOverrideHeaders(apiConfig) })
   return Array.isArray(response.data?.models) ? response.data.models : []
+}
+
+export const getAvailableModelLists = async (
+  apiConfig?: ApiConfig
+): Promise<{ chatModels: string[]; embeddingModels: string[]; allModels: string[] }> => {
+  const response = await api.get<AvailableModelsResponse>('/models', { headers: buildApiOverrideHeaders(apiConfig) })
+  const chatModels = Array.isArray(response.data?.models) ? response.data.models : []
+  const embeddingModels = Array.isArray(response.data?.embeddingModels) ? response.data.embeddingModels : []
+  const allModels = Array.isArray(response.data?.allModels) ? response.data.allModels : chatModels
+  return { chatModels, embeddingModels, allModels }
 }
 
 export type StreamEvent =
@@ -172,7 +196,7 @@ const pickRandomModelExcluding = (models: string[] | undefined, exclude: string 
 
 const clean = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
 
-function buildApiOverrideHeaders(apiConfig?: ApiConfig) {
+export function buildApiOverrideHeaders(apiConfig?: ApiConfig) {
   if (!apiConfig?.apiKey) return {}
   const headers: Record<string, string> = { 'X-AAS-Api-Key': apiConfig.apiKey }
   if (apiConfig.baseUrl) headers['X-AAS-Base-Url'] = apiConfig.baseUrl
@@ -182,11 +206,13 @@ function buildApiOverrideHeaders(apiConfig?: ApiConfig) {
   const debateModel1 = clean(apiConfig.debateModel1) || pickRandomModel(candidates) || ''
   const debateModel2 = clean(apiConfig.debateModel2) || pickRandomModelExcluding(candidates, debateModel1) || ''
   const routerModel = clean(apiConfig.routerModel) || pickRandomModel(candidates) || ''
+  const embeddingModel = clean(apiConfig.embeddingModel)
 
   if (singleModel) headers['X-AAS-Model-Single'] = singleModel
   if (debateModel1) headers['X-AAS-Model-Debate-1'] = debateModel1
   if (debateModel2) headers['X-AAS-Model-Debate-2'] = debateModel2
   if (routerModel) headers['X-AAS-Model-Router'] = routerModel
+  if (embeddingModel) headers['X-AAS-Model-Embedding'] = embeddingModel
 
   return headers
 }
@@ -245,7 +271,7 @@ export const solveQuestionStream = async (
 
   const reader = response.body.getReader()
   const decoder = new TextDecoder('utf-8')
-  let buffer = ''
+  const bufferRef = { value: '' }
   let finalResult: SolveQuestionResponse | null = null
   let lastCompleteResult: SolveQuestionResponse | null = null
 
@@ -313,6 +339,22 @@ export const solveQuestionStream = async (
   return finalResult
 }
 
+export const solveQuestionText = async (
+  text: string,
+  apiConfig?: ApiConfig,
+  mode?: 'single' | 'debate' | 'auto',
+  subject?: 'science' | 'humanities' | 'unknown'
+): Promise<SolveQuestionResponse> => {
+  const payload: Record<string, unknown> = { text }
+  if (mode) payload.mode = mode
+  if (subject) payload.subject = subject
+
+  const response = await api.post<SolveQuestionResponse>('/solve-text-auto', payload, {
+    headers: { ...buildApiOverrideHeaders(apiConfig) }
+  })
+  return response.data
+}
+
 export const solveQuestionMultiStream = async (
   imageBlobs: Blob[],
   prompt: string | undefined,
@@ -361,7 +403,7 @@ export const solveQuestionMultiStream = async (
 
   const reader = response.body.getReader()
   const decoder = new TextDecoder('utf-8')
-  let buffer = ''
+  const bufferRef = { value: '' }
   let finalResult: SolveQuestionResponse | null = null
   let lastCompleteResult: SolveQuestionResponse | null = null
 
@@ -462,13 +504,6 @@ export const solveQuestionTextStream = async (
   const usage = getUsageInfoFromHeaders(response.headers)
   if (usage) onUsage?.(usage)
 
-  if (!response.body) {
-    throw new Error('服务器未返回流式响应')
-  }
-
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buffer = ''
   let finalResult: SolveQuestionResponse | null = null
   let lastCompleteResult: SolveQuestionResponse | null = null
 
@@ -501,28 +536,68 @@ export const solveQuestionTextStream = async (
     }
   }
 
-  const processBuffer = () => {
-    let splitIndex = buffer.indexOf('\n\n')
+  const processBuffer = (bufferRef: { value: string }) => {
+    let splitIndex = bufferRef.value.indexOf('\n\n')
     while (splitIndex !== -1) {
-      const chunk = buffer.slice(0, splitIndex)
-      buffer = buffer.slice(splitIndex + 2)
-      splitIndex = buffer.indexOf('\n\n')
+      const chunk = bufferRef.value.slice(0, splitIndex)
+      bufferRef.value = bufferRef.value.slice(splitIndex + 2)
+      splitIndex = bufferRef.value.indexOf('\n\n')
       processChunk(chunk)
     }
   }
 
+  const contentType = response.headers.get('content-type') || ''
+  if (contentType && !contentType.includes('text/event-stream')) {
+    const rawText = await response.text()
+    if (rawText?.trim()) {
+      try {
+        const data = JSON.parse(rawText) as SolveQuestionResponse
+        if (data && typeof data.answer === 'string' && typeof data.question === 'string') {
+          return data
+        }
+      } catch {
+        // fall through to SSE parsing
+      }
+
+      const bufferRef = { value: rawText.replace(/\r\n/g, '\n') }
+      processBuffer(bufferRef)
+      if (bufferRef.value.trim()) {
+        processChunk(bufferRef.value)
+      }
+
+      if (!finalResult && lastCompleteResult) {
+        finalResult = lastCompleteResult
+      }
+      if (finalResult) {
+        return finalResult
+      }
+
+      throw new Error(`服务端返回非流式响应：${rawText.slice(0, 200)}`)
+    }
+
+    return solveQuestionText(text, apiConfig, mode, subject)
+  }
+
+  if (!response.body) {
+    return solveQuestionText(text, apiConfig, mode, subject)
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  const bufferRef = { value: '' }
+
   while (true) {
     const { value, done } = await reader.read()
     if (done) break
-    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
-    processBuffer()
+    bufferRef.value += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
+    processBuffer(bufferRef)
   }
 
-  buffer += decoder.decode().replace(/\r\n/g, '\n')
-  processBuffer()
+  bufferRef.value += decoder.decode().replace(/\r\n/g, '\n')
+  processBuffer(bufferRef)
 
-  if (buffer.trim()) {
-    processChunk(buffer)
+  if (bufferRef.value.trim()) {
+    processChunk(bufferRef.value)
   }
 
   if (!finalResult && lastCompleteResult) {
@@ -530,7 +605,7 @@ export const solveQuestionTextStream = async (
   }
 
   if (!finalResult) {
-    throw new Error('未收到最终结果')
+    return solveQuestionText(text, apiConfig, mode, subject)
   }
 
   return finalResult

@@ -1,4 +1,7 @@
 # 全部答案搜题AAS
+![homepage_logo.jpg](https://youke.xn--y7xa690gmna.cn/s1/2026/02/01/697eb1d1386d7.webp)
+![home_page.png](https://youke.xn--y7xa690gmna.cn/s1/2026/02/01/697eb1d413f64.webp)
+![search.png](https://youke.xn--y7xa690gmna.cn/s1/2026/02/01/697eb1d31a28f.webp)
 
 一个基于AI的智能搜题网页应用，支持上传图片、裁剪题目区域，并通过AI识别和解答问题。
 

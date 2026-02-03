@@ -1,5 +1,8 @@
 import type { PyodideInterface } from "pyodide";
 import { loadPyodide } from "pyodide";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 type RunPythonArgs = {
   code: string;
@@ -36,7 +39,12 @@ function pyodideLogWriter(kind: "stdout" | "stderr"): (msg: string) => void {
 
 async function getPyodide(): Promise<PyodideInterface> {
   if (!pyodidePromise) {
-    const indexURL = process.env.PYODIDE_INDEX_URL?.trim();
+    let indexURL = process.env.PYODIDE_INDEX_URL?.trim();
+    if (!indexURL) {
+      const distDir = path.dirname(fileURLToPath(import.meta.url));
+      const localIndex = path.resolve(distDir, "../node_modules/pyodide/");
+      if (fs.existsSync(localIndex)) indexURL = localIndex;
+    }
     if (indexURL && /^https?:\/\//i.test(indexURL)) {
       throw new Error("PYODIDE_INDEX_URL must be a local filesystem path in Node (http(s) URLs are not supported).");
     }

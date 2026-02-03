@@ -64,6 +64,14 @@ const TEXT_PROMPT = TEXT_PROMPT_BASE + '\n\n' + MULTIPLE_CHOICE_HINT
 
 export const __TESTING__ = { PROMPT, TEXT_PROMPT, MULTIPLE_CHOICE_HINT }
 
+const isAbortError = (error: unknown): boolean => {
+  if (!error) return false
+  const anyErr = error as any
+  if (typeof anyErr?.name === 'string' && anyErr.name === 'AbortError') return true
+  const msg = typeof anyErr?.message === 'string' ? anyErr.message : ''
+  return msg === 'Aborted' || msg === 'The operation was aborted.'
+}
+
 const toText = (content: any): string => {
   if (!content) return ''
   if (typeof content === 'string') return content
@@ -301,7 +309,8 @@ export async function solveQuestionStreamFromImages(
     onUpdate?.({ type: 'complete', value: content, result })
     return result
   } catch (error) {
-    console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
+    if (!isAbortError(error)) console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
+    if (isAbortError(error)) throw error
     onUpdate?.({
       type: 'error',
       message: error instanceof Error ? error.message : 'AI解答失败，请检查API配置'
@@ -333,7 +342,7 @@ export async function solveQuestionFromImages(
 
     return { ...parsed, tokensUsed }
   } catch (error) {
-    console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
+    if (!isAbortError(error)) console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
     throw new Error('AI解答失败，请检查API配置')
   }
 }
@@ -359,7 +368,7 @@ export async function solveQuestionFromText(
 
     return { question: q, answer: parsed.answer || content, tokensUsed }
   } catch (error) {
-    console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
+    if (!isAbortError(error)) console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
     throw new Error('AI解答失败，请检查 API 配置')
   }
 }
@@ -411,7 +420,8 @@ export async function solveQuestionStreamFromText(
     onUpdate?.({ type: 'complete', value: content, result })
     return result
   } catch (error) {
-    console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
+    if (!isAbortError(error)) console.error('OpenAI API调用失败:', error instanceof Error ? error.message : error)
+    if (isAbortError(error)) throw error
     onUpdate?.({
       type: 'error',
       message: error instanceof Error ? error.message : 'AI解答失败，请检查 API 配置'

@@ -8,6 +8,7 @@ export type ApiOverride = {
   debateModel1?: string
   debateModel2?: string
   routerModel?: string
+  embeddingModel?: string
 }
 
 const clean = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
@@ -21,8 +22,9 @@ export const normalizeApiOverride = (override: ApiOverride | undefined): ApiOver
   const debateModel1 = clean(override.debateModel1)
   const debateModel2 = clean(override.debateModel2)
   const routerModel = clean(override.routerModel)
+  const embeddingModel = clean(override.embeddingModel)
 
-  if (!apiKey && !baseURL && !model && !singleModel && !debateModel1 && !debateModel2 && !routerModel) return undefined
+  if (!apiKey && !baseURL && !model && !singleModel && !debateModel1 && !debateModel2 && !routerModel && !embeddingModel) return undefined
   return {
     ...(apiKey ? { apiKey } : {}),
     ...(baseURL ? { baseURL } : {}),
@@ -30,6 +32,7 @@ export const normalizeApiOverride = (override: ApiOverride | undefined): ApiOver
     ...(singleModel ? { singleModel } : {}),
     ...(debateModel1 ? { debateModel1 } : {}),
     ...(debateModel2 ? { debateModel2 } : {}),
-    ...(routerModel ? { routerModel } : {})
+    ...(routerModel ? { routerModel } : {}),
+    ...(embeddingModel ? { embeddingModel } : {})
   }
 }

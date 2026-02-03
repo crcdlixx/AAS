@@ -23,7 +23,7 @@ import MarkdownView from './components/MarkdownView'
 import KnowledgeBasePanel from './components/KnowledgeBasePanel'
 import {
   followUpQuestion,
-  getAvailableModels,
+  getAvailableModelLists,
   getUsage,
   solveQuestionMultiStream,
   solveQuestionTextStream,
@@ -105,7 +105,9 @@ function App() {
   const [apiDebateModel1, setApiDebateModel1] = useState('')
   const [apiDebateModel2, setApiDebateModel2] = useState('')
   const [apiRouterModel, setApiRouterModel] = useState('')
+  const [apiEmbeddingModel, setApiEmbeddingModel] = useState('')
   const [availableModels, setAvailableModels] = useState<string[]>([])
+  const [availableEmbeddingModels, setAvailableEmbeddingModels] = useState<string[]>([])
   const [availableModelsLoading, setAvailableModelsLoading] = useState(false)
   const [customAvailableModels, setCustomAvailableModels] = useState<string[]>([])
   const fileImportRef = useRef<HTMLInputElement | null>(null)
@@ -149,6 +151,7 @@ function App() {
     const debateModel1 = apiDebateModel1.trim()
     const debateModel2 = apiDebateModel2.trim()
     const routerModel = apiRouterModel.trim()
+    const embeddingModel = apiEmbeddingModel.trim()
     const modelCandidates = [...new Set([...customAvailableModels, ...availableModels].map((m) => m.trim()).filter(Boolean))]
 
     return {
@@ -158,6 +161,7 @@ function App() {
       debateModel1: debateModel1 || undefined,
       debateModel2: debateModel2 || undefined,
       routerModel: routerModel || undefined,
+      embeddingModel: embeddingModel || undefined,
       modelCandidates: modelCandidates.length ? modelCandidates : undefined
     }
   }, [
@@ -168,6 +172,7 @@ function App() {
     apiDebateModel1,
     apiDebateModel2,
     apiRouterModel,
+    apiEmbeddingModel,
     customAvailableModels,
     availableModels
   ])
@@ -177,8 +182,9 @@ function App() {
     try {
       const key = apiKey.trim()
       const baseUrl = apiBaseUrl.trim()
-      const models = await getAvailableModels(key ? { apiKey: key, baseUrl: baseUrl || undefined } : undefined)
-      setAvailableModels(models)
+      const lists = await getAvailableModelLists(key ? { apiKey: key, baseUrl: baseUrl || undefined } : undefined)
+      setAvailableModels(lists.chatModels)
+      setAvailableEmbeddingModels(lists.embeddingModels.length ? lists.embeddingModels : lists.allModels)
     } catch (e) {
       message.error(e instanceof Error ? e.message : '获取模型列表失败')
     } finally {
@@ -200,6 +206,7 @@ function App() {
       debateModel1: apiDebateModel1.trim() || undefined,
       debateModel2: apiDebateModel2.trim() || undefined,
       routerModel: apiRouterModel.trim() || undefined,
+      embeddingModel: apiEmbeddingModel.trim() || undefined,
       availableModels: customAvailableModels
     }
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
@@ -249,6 +256,7 @@ function App() {
           ? data.model
           : ''
     const importedRouterModel = typeof data.routerModel === 'string' ? data.routerModel : ''
+    const importedEmbeddingModel = typeof data.embeddingModel === 'string' ? data.embeddingModel : ''
     const importedAvailableModels = Array.isArray(data.availableModels)
       ? data.availableModels.filter((x: unknown) => typeof x === 'string').map((x: string) => x.trim()).filter(Boolean)
       : []
@@ -260,6 +268,7 @@ function App() {
     setApiDebateModel1(importedDebateModel1)
     setApiDebateModel2(importedDebateModel2)
     setApiRouterModel(importedRouterModel)
+    setApiEmbeddingModel(importedEmbeddingModel)
     setCustomAvailableModels(importedAvailableModels)
     message.success('已导入配置')
   }
@@ -1188,7 +1197,7 @@ function App() {
           </Space>
 
           <div style={{ marginTop: 16 }}>
-            <KnowledgeBasePanel files={knowledgeBaseFiles} onFilesChange={setKnowledgeBaseFiles} />
+            <KnowledgeBasePanel files={knowledgeBaseFiles} onFilesChange={setKnowledgeBaseFiles} apiConfig={activeApiConfig} />
           </div>
 
           <div className="action-buttons" style={{ justifyContent: 'space-between' }}>
@@ -1572,6 +1581,7 @@ function App() {
                   setApiDebateModel1('')
                   setApiDebateModel2('')
                   setApiRouterModel('')
+                  setApiEmbeddingModel('')
                 }}
               >
                 清空
@@ -1691,6 +1701,22 @@ function App() {
                     placeholder="例如：gpt-4o-mini"
                     style={{ width: '100%' }}
                     options={[...new Set([...customAvailableModels, ...availableModels])].map((m) => ({ value: m, label: m }))}
+                    filterOption={(input, option) =>
+                      (option?.value ?? '')
+                        .toString()
+                        .toLowerCase()
+                        .includes(input.toLowerCase())
+                    }
+                  />
+                </div>
+                <div>
+                  <div style={{ marginBottom: 6, color: 'rgba(0,0,0,0.65)' }}>知识库嵌入模型（不填则使用默认）</div>
+                  <AutoComplete
+                    value={apiEmbeddingModel}
+                    onChange={setApiEmbeddingModel}
+                    placeholder="例如：text-embedding-3-small"
+                    style={{ width: '100%' }}
+                    options={[...new Set([...customAvailableModels, ...availableEmbeddingModels, ...availableModels])].map((m) => ({ value: m, label: m }))}
                     filterOption={(input, option) =>
                       (option?.value ?? '')
                         .toString()
